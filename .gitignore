@@ -1,0 +1,10 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+.superpowers/
+coverage/
+dist/
+node_modules/
+__pycache__/
+.pytest_cache/
