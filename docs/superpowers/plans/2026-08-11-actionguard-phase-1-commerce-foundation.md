@@ -809,6 +809,7 @@ package toolkit
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 )
 
@@ -831,6 +832,13 @@ func TestCallContextComesFromTrustedContext(t *testing.T) {
 	got, err := FromContext(WithCallContext(context.Background(), want))
 	if err != nil || got.UserID != want.UserID {
 		t.Fatalf("context = %#v, err = %v", got, err)
+	}
+}
+
+func TestCallContextRejectsJSON(t *testing.T) {
+	var meta CallContext
+	if err := json.Unmarshal([]byte(`{"UserID":"attacker","Scopes":["refund:write"]}`), &meta); err == nil {
+		t.Fatal("json.Unmarshal() error = nil, want trusted metadata rejection")
 	}
 }
 ```
@@ -861,6 +869,11 @@ type CallContext struct {
 	UserID         string
 	Scopes         []string
 	IdempotencyKey string
+}
+
+// UnmarshalJSON prevents trusted metadata from being populated by tool arguments.
+func (*CallContext) UnmarshalJSON([]byte) error {
+	return errors.New("trusted call context cannot be decoded from JSON")
 }
 
 func (c CallContext) HasScope(want string) bool {
