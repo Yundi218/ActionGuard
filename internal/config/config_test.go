@@ -24,6 +24,7 @@ func TestLoadRequiresGatewayToken(t *testing.T) {
 
 func TestLoadUsesExplicitAddresses(t *testing.T) {
 	setDeterministicProviders(t)
+	setAPIEnvironment(t)
 	t.Setenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/actionguard?sslmode=disable")
 	t.Setenv("MCP_GATEWAY_TOKEN", "test-gateway-token")
 	t.Setenv("API_ADDR", ":8090")
@@ -92,6 +93,10 @@ func TestLoadIncludesProviderSettings(t *testing.T) {
 	setProviderEnvironment(t, ProviderOpenAI, ProviderDeterministic, "secret-key", "https://openai.example.test", "planner-model", "")
 	t.Setenv("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/actionguard?sslmode=disable")
 	t.Setenv("MCP_GATEWAY_TOKEN", "test-gateway-token")
+	t.Setenv("MCP_URL", "http://127.0.0.1:8081/mcp")
+	t.Setenv("DEMO_FULL_TOKEN", "full-token")
+	t.Setenv("DEMO_READ_ONLY_TOKEN", "read-token")
+	t.Setenv("DEMO_USER_999_TOKEN", "other-token")
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -101,9 +106,42 @@ func TestLoadIncludesProviderSettings(t *testing.T) {
 	}
 }
 
+func TestLoadRequiresExplicitAPISecretsAndMCPURLWithoutLeakingValues(t *testing.T) {
+	setDeterministicProviders(t)
+	t.Setenv("DATABASE_URL", "postgres://example.test/actionguard")
+	t.Setenv("MCP_GATEWAY_TOKEN", "gateway-secret")
+	t.Setenv("MCP_URL", "http://127.0.0.1:8081/mcp")
+	t.Setenv("DEMO_FULL_TOKEN", "full-secret")
+	t.Setenv("DEMO_READ_ONLY_TOKEN", "read-secret")
+	t.Setenv("DEMO_USER_999_TOKEN", "other-secret")
+	keys := []string{"MCP_URL", "DEMO_FULL_TOKEN", "DEMO_READ_ONLY_TOKEN", "DEMO_USER_999_TOKEN"}
+	for _, key := range keys {
+		t.Run(key, func(t *testing.T) {
+			t.Setenv(key, "")
+			_, err := Load()
+			if err == nil {
+				t.Fatal("Load error = nil")
+			}
+			for _, secret := range []string{"gateway-secret", "full-secret", "read-secret", "other-secret"} {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("error leaked secret: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func setDeterministicProviders(t *testing.T) {
 	t.Helper()
 	setProviderEnvironment(t, ProviderDeterministic, ProviderDeterministic, "", "", "", "")
+}
+
+func setAPIEnvironment(t *testing.T) {
+	t.Helper()
+	t.Setenv("MCP_URL", "http://127.0.0.1:8081/mcp")
+	t.Setenv("DEMO_FULL_TOKEN", "full-token")
+	t.Setenv("DEMO_READ_ONLY_TOKEN", "read-token")
+	t.Setenv("DEMO_USER_999_TOKEN", "other-token")
 }
 
 func setProviderEnvironment(t *testing.T, llmProvider, embeddingProvider, apiKey, baseURL, plannerModel, embeddingModel string) {

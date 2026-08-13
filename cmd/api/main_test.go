@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -9,6 +10,10 @@ import (
 	"os"
 	"testing"
 	"time"
+
+	"github.com/Yundi218/ActionGuard/internal/config"
+	"github.com/Yundi218/ActionGuard/internal/llm"
+	"github.com/Yundi218/ActionGuard/internal/policy"
 )
 
 func TestNewAPIServerWiresSharedTimeoutsAndRouter(t *testing.T) {
@@ -27,6 +32,54 @@ func TestNewAPIServerWiresSharedTimeoutsAndRouter(t *testing.T) {
 
 func TestMainDelegatesToAPIServerFactory(t *testing.T) {
 	requireMainCallsFactory(t, "newAPIServer")
+}
+
+func TestDemoAuthenticatorUsesFixedCanonicalAuthorization(t *testing.T) {
+	cfg := config.Config{DemoFullToken: "full", DemoReadOnlyToken: "read", DemoUser999Token: "other"}
+	authenticator, err := newDemoAuthenticator(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		token, user string
+		scopes      int
+	}{{"full", "user_018", 8}, {"read", "user_018", 4}, {"other", "user_999", 8}}
+	for _, test := range tests {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		req.Header.Set("Authorization", "Bearer "+test.token)
+		principal, err := authenticator.Authenticate(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if principal.UserID != test.user || len(principal.Scopes) != test.scopes {
+			t.Fatalf("principal=%#v", principal)
+		}
+	}
+}
+
+func TestProviderCompositionIsExplicitAndOfflineByDefault(t *testing.T) {
+	settings := config.ProviderSettings{LLMProvider: config.ProviderDeterministic, EmbeddingProvider: config.ProviderDeterministic}
+	planner, err := newPlanner(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := planner.(*llm.FixturePlanner); !ok {
+		t.Fatalf("planner=%T", planner)
+	}
+	embedder, err := newEmbedder(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := embedder.(policy.DeterministicEmbedder); !ok {
+		t.Fatalf("embedder=%T", embedder)
+	}
+	if _, err := newPlanner(config.ProviderSettings{LLMProvider: "unknown"}); err == nil {
+		t.Fatal("unknown planner accepted")
+	}
+	if _, err := newEmbedder(config.ProviderSettings{EmbeddingProvider: "unknown"}); err == nil {
+		t.Fatal("unknown embedder accepted")
+	}
+	_, _ = planner.Plan(context.Background(), llm.PlanRequest{})
 }
 
 func requireServerTimeouts(t *testing.T, server *http.Server) {
