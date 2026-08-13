@@ -436,6 +436,62 @@ func TestPostgresStoreServiceReplaysReplacementAfterLastUnit(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreServiceSerializesConcurrentSameKeyReplacementAtInventoryBoundary(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `update inventory set available = 1 where sku = 'SKU-RED-42'`); err != nil {
+		t.Fatal(err)
+	}
+
+	svc := NewServiceWithClock(store, func() time.Time { return postgresStoreTestTime })
+	type outcome struct {
+		result WriteResult
+		err    error
+	}
+	start := make(chan struct{})
+	outcomes := make(chan outcome, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			callCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			result, err := svc.CreateReplacement(callCtx, "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-same-key-concurrent")
+			outcomes <- outcome{result: result, err: err}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(outcomes)
+
+	var results []WriteResult
+	for outcome := range outcomes {
+		if outcome.err != nil {
+			t.Fatal(outcome.err)
+		}
+		results = append(results, outcome.result)
+	}
+	if len(results) != 2 || results[0].ResourceID == "" || results[0].ResourceID != results[1].ResourceID {
+		t.Fatalf("results = %#v", results)
+	}
+	if results[0].Replayed == results[1].Replayed {
+		t.Fatalf("expected exactly one replay, results = %#v", results)
+	}
+
+	var replacements, available, reserved int
+	if err := store.pool.QueryRow(ctx, `select count(*) from replacements`).Scan(&replacements); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select available, reserved from inventory where sku = 'SKU-RED-42'`).Scan(&available, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if replacements != 1 || available != 0 || reserved != 1 {
+		t.Fatalf("database state: replacements=%d available=%d reserved=%d", replacements, available, reserved)
+	}
+}
+
 func TestPostgresStoreServiceReplaysFullRefund(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

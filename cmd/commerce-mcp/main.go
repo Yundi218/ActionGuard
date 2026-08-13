@@ -34,8 +34,13 @@ func main() {
 
 	svc := commerce.NewService(commerce.NewPostgresStore(pool))
 	handler := newMCPHandler(mcpserver.New(svc), cfg.MCPGatewayToken)
+	server := newCommerceMCPServer(cfg.MCPAddr, handler)
 	log.Printf("commerce MCP listening on %s/mcp", cfg.MCPAddr)
-	log.Fatal(httpserver.New(cfg.MCPAddr, handler).ListenAndServe())
+	log.Fatal(server.ListenAndServe())
+}
+
+func newCommerceMCPServer(addr string, handler http.Handler) *http.Server {
+	return httpserver.New(addr, handler)
 }
 
 func newMCPHandler(server *mcp.Server, token string) http.Handler {

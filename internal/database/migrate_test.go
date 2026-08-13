@@ -2,6 +2,7 @@ package database
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Yundi218/ActionGuard/internal/commerce"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -217,8 +219,18 @@ func TestMigrateUpgradesLegacyIdempotencyRecordsIdempotently(t *testing.T) {
 	`).Scan(&principalID, &fingerprint); err != nil {
 		t.Fatal(err)
 	}
-	if principalID == "" || len(fingerprint) != 64 {
+	if principalID != "__legacy_unbound__" || fingerprint != strings.Repeat("0", 64) {
 		t.Fatalf("legacy binding = principal %q fingerprint %q", principalID, fingerprint)
+	}
+
+	result, replayed, err := commerce.NewPostgresStore(pool).ReplayWrite(ctx, commerce.IdempotencyIdentity{
+		Operation:          "create_return",
+		Key:                "legacy-key",
+		PrincipalID:        "user_018",
+		RequestFingerprint: strings.Repeat("a", 64),
+	})
+	if !errors.Is(err, commerce.ErrIdempotencyConflict) || replayed || result != (commerce.WriteResult{}) {
+		t.Fatalf("legacy replay = %#v, replayed=%t, err=%v; want empty conflict", result, replayed, err)
 	}
 }
 

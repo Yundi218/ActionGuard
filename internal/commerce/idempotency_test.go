@@ -2,6 +2,7 @@ package commerce
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +122,36 @@ func TestReturnIdentityHashesCanonicalTypedJSON(t *testing.T) {
 	const want = "5a16503e2015fda33c014bf303ce923adaa0efc523dab5230fa955aa32e3d53e"
 	if identity.RequestFingerprint != want {
 		t.Fatalf("fingerprint = %q, want %q", identity.RequestFingerprint, want)
+	}
+}
+
+func TestIdempotencyIdentityValidationRequiresLowercaseASCIIHexFingerprint(t *testing.T) {
+	valid := IdempotencyIdentity{
+		Operation:          createReturnOperation,
+		Key:                "key-1",
+		PrincipalID:        "user-1",
+		RequestFingerprint: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+	}
+	tests := []struct {
+		name        string
+		fingerprint string
+		wantErr     bool
+	}{
+		{name: "lowercase hex", fingerprint: valid.RequestFingerprint},
+		{name: "uppercase hex", fingerprint: "0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef", wantErr: true},
+		{name: "invalid ASCII character", fingerprint: "g123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", wantErr: true},
+		{name: "unicode character", fingerprint: strings.Repeat("a", 62) + "é", wantErr: true},
+		{name: "wrong length", fingerprint: valid.RequestFingerprint[:63], wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			identity := valid
+			identity.RequestFingerprint = tt.fingerprint
+			err := identity.validate(createReturnOperation)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("validate() error = %v, want error = %t", err, tt.wantErr)
+			}
+		})
 	}
 }

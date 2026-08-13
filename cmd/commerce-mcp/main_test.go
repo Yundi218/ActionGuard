@@ -1,14 +1,69 @@
 package main
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Yundi218/ActionGuard/internal/mcpserver"
 )
+
+func TestNewCommerceMCPServerWiresSharedTimeoutsAndHandler(t *testing.T) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	server := newCommerceMCPServer("127.0.0.1:18081", handler)
+	if server.Addr != "127.0.0.1:18081" {
+		t.Fatalf("address = %q", server.Addr)
+	}
+	if server.ReadHeaderTimeout != 5*time.Second || server.ReadTimeout != 15*time.Second || server.WriteTimeout != 30*time.Second || server.IdleTimeout != 60*time.Second {
+		t.Fatalf("timeouts = header:%s read:%s write:%s idle:%s", server.ReadHeaderTimeout, server.ReadTimeout, server.WriteTimeout, server.IdleTimeout)
+	}
+	response := httptest.NewRecorder()
+	server.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("handler status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+}
+
+func TestMainDelegatesToCommerceMCPServerFactory(t *testing.T) {
+	source, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := parser.ParseFile(token.NewFileSet(), "main.go", source, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	called := false
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "main" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			identifier, ok := call.Fun.(*ast.Ident)
+			if ok && identifier.Name == "newCommerceMCPServer" {
+				called = true
+			}
+			return true
+		})
+	}
+	if !called {
+		t.Fatal("main must delegate to newCommerceMCPServer instead of calling a server directly")
+	}
+}
 
 const testMCPBodyLimit = 1 << 20
 

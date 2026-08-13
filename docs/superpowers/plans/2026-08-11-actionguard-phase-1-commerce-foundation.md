@@ -1505,7 +1505,7 @@ Phase 1 is complete only when all of the following evidence exists in the reposi
 - Repeating a write with the same operation, idempotency key, principal, and exact arguments produces one database side effect and replays the original result even after mutable preconditions change.
 - Reusing an operation/key with a different principal or argument returns `ErrIdempotencyConflict`, leaks no original resource ID, and creates no additional side effect.
 - Cross-user access and missing write Scope are rejected.
-- Malicious shipment or product text remains inside `untrusted_text`.
+- Malicious shipment notes returned by current tools remain inside `untrusted_text`; product descriptions are stored only as synthetic untrusted fixture data and are not returned by current tools.
 - README labels later Agent, RAG, Temporal, evaluation, and UI work as roadmap rather than completed functionality.
 
 After this gate, write the Phase 2 plan for Policy RAG, Typed Planner, and Plan Verifier against the stable `commerce.Service` and MCP contracts.

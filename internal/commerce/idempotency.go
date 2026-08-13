@@ -107,8 +107,11 @@ func (identity IdempotencyIdentity) validate(operation string) error {
 	if identity.Operation != operation || identity.PrincipalID == "" || len(identity.RequestFingerprint) != sha256.Size*2 {
 		return ErrInternalTool
 	}
-	if _, err := hex.DecodeString(identity.RequestFingerprint); err != nil {
-		return ErrInternalTool
+	for i := 0; i < len(identity.RequestFingerprint); i++ {
+		fingerprintByte := identity.RequestFingerprint[i]
+		if (fingerprintByte < '0' || fingerprintByte > '9') && (fingerprintByte < 'a' || fingerprintByte > 'f') {
+			return ErrInternalTool
+		}
 	}
 	return nil
 }
