@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unsafe"
@@ -510,6 +511,51 @@ func TestNewMCPExecutorCancellationPrecedesOversizedInitialize(t *testing.T) {
 	}
 }
 
+func TestNewMCPExecutorRejectsPreCanceledContextWithoutTransportAttempts(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	defer runtime.GOMAXPROCS(previousProcs)
+
+	transport := &attemptCountingTransport{}
+	config := MCPConfig{
+		Endpoint:     "http://mcp.invalid/mcp",
+		GatewayToken: testGatewayToken,
+		HTTPClient:   &http.Client{Transport: transport},
+	}
+	for iteration := 0; iteration < 100; iteration++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		executor, err := NewMCPExecutor(ctx, config)
+		if executor != nil || !errors.Is(err, context.Canceled) {
+			t.Fatalf("iteration %d: NewMCPExecutor() = %#v, %v; want nil/context.Canceled", iteration, executor, err)
+		}
+	}
+	if got := transport.attempts.Load(); got != 0 {
+		t.Fatalf("transport attempts = %d, want zero", got)
+	}
+
+	canceledContext, cancel := context.WithCancel(context.Background())
+	cancel()
+	executor, err := NewMCPExecutor(canceledContext, MCPConfig{})
+	if executor != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewMCPExecutor() with invalid config = %#v, %v; want cancellation precedence", executor, err)
+	}
+}
+
+func TestNewMCPExecutorRejectsNilContext(t *testing.T) {
+	transport := &attemptCountingTransport{}
+	executor, err := NewMCPExecutor(nil, MCPConfig{
+		Endpoint:     "http://mcp.invalid/mcp",
+		GatewayToken: testGatewayToken,
+		HTTPClient:   &http.Client{Transport: transport},
+	})
+	if executor != nil || !errors.Is(err, ErrInvalidExecution) {
+		t.Fatalf("NewMCPExecutor() = %#v, %v; want nil/ErrInvalidExecution", executor, err)
+	}
+	if got := transport.attempts.Load(); got != 0 {
+		t.Fatalf("transport attempts = %d, want zero", got)
+	}
+}
+
 func TestConnectContextBridgeDropsCallerValuesAndReleasesResources(t *testing.T) {
 	callerValueKey := &struct{ name string }{name: "caller-value"}
 	deadline := time.Now().Add(time.Hour)
@@ -539,6 +585,21 @@ func TestConnectContextBridgeDropsCallerValuesAndReleasesResources(t *testing.T)
 	case <-bridge.Done():
 	default:
 		t.Fatal("bridge cleanup did not cancel the bridge deadline context")
+	}
+}
+
+func TestConnectContextBridgeClosesCancellationRegistrationRace(t *testing.T) {
+	caller := &cancelDuringAfterFuncContext{done: make(chan struct{})}
+	bridge, cleanup := newConnectContextBridge(caller)
+	defer cleanup()
+
+	select {
+	case <-bridge.Done():
+		if !errors.Is(bridge.Err(), context.Canceled) {
+			t.Fatalf("bridge error = %v, want context.Canceled", bridge.Err())
+		}
+	default:
+		t.Fatal("bridge returned live after caller canceled during AfterFunc registration")
 	}
 }
 
@@ -874,6 +935,15 @@ type oversizedInitializeTransport struct {
 	headers http.Header
 }
 
+type attemptCountingTransport struct {
+	attempts atomic.Int64
+}
+
+func (transport *attemptCountingTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	transport.attempts.Add(1)
+	return nil, errors.New("unexpected transport attempt")
+}
+
 const cleanupTransportSafetyTimeout = 750 * time.Millisecond
 
 type cleanupDeadlineTransport struct {
@@ -1026,6 +1096,26 @@ type trackingAfterFuncContext struct {
 	value    any
 	stopped  chan struct{}
 	stopOnce sync.Once
+}
+
+type cancelDuringAfterFuncContext struct {
+	done       chan struct{}
+	registered atomic.Bool
+}
+
+func (*cancelDuringAfterFuncContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (ctx *cancelDuringAfterFuncContext) Done() <-chan struct{}   { return ctx.done }
+func (ctx *cancelDuringAfterFuncContext) Err() error {
+	if ctx.registered.Load() {
+		return context.Canceled
+	}
+	return nil
+}
+func (*cancelDuringAfterFuncContext) Value(any) any { return nil }
+
+func (ctx *cancelDuringAfterFuncContext) AfterFunc(func()) func() bool {
+	ctx.registered.Store(true)
+	return func() bool { return true }
 }
 
 func (ctx *trackingAfterFuncContext) Deadline() (time.Time, bool) { return ctx.deadline, true }

@@ -39,6 +39,12 @@ type MCPExecutor struct {
 }
 
 func NewMCPExecutor(ctx context.Context, config MCPConfig) (*MCPExecutor, error) {
+	if ctx == nil {
+		return nil, ErrInvalidExecution
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	endpoint, err := validateEndpoint(config.Endpoint)
 	if err != nil || !validGatewayToken(config.GatewayToken) {
 		return nil, ErrInvalidExecution
@@ -84,6 +90,9 @@ func newConnectContextBridge(caller context.Context) (context.Context, func()) {
 		bridge, cancel = context.WithCancel(context.Background())
 	}
 	stopForwarding := context.AfterFunc(caller, cancel)
+	if caller.Err() != nil {
+		cancel()
+	}
 	return bridge, sync.OnceFunc(func() {
 		stopForwarding()
 		cancel()
