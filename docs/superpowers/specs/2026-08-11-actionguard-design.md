@@ -85,6 +85,8 @@ flowchart LR
 
 Session API 不直接执行工具，也不持有业务规则判断。
 
+Phase 2 的公开 API 不信任调用方提交的用户或 Scope Header。`Authenticator` 根据 Bearer 凭证在服务端解析不可变的 `Principal{UserID, Scopes}`；请求 JSON、`X-ActionGuard-User` 和 `X-ActionGuard-Scopes` 都不能覆盖该身份。公开 Demo 使用固定虚构 Principal 配置，生产身份系统不属于本项目范围。
+
 ### 5.2 Agent Orchestrator
 
 职责：
@@ -108,16 +110,19 @@ Session API 不直接执行工具，也不持有业务规则判断。
 - `region`
 - `product_category`
 - `risk_level`
+- `max_coupon_cents`：仅补偿策略允许设置的可选类型化上限
 
 检索流程：
 
 1. 从当前会话提取意图、商品类型、订单时间和地区过滤条件。
-2. 使用 PostgreSQL Full Text Search 与 pgvector 进行混合检索。
-3. 使用 Reciprocal Rank Fusion 合并两个候选列表。
-4. 按有效期和元数据过滤不适用条款。
+2. 在全文和向量两路候选 SQL 中先按 `[effective_from, effective_to)`、地区、商品类型和风险等级过滤，再执行各自的候选 `LIMIT`。
+3. 使用 PostgreSQL Full Text Search 与 pgvector 生成两个候选列表。
+4. 使用 Reciprocal Rank Fusion 合并两个候选列表。
 5. 返回最多 5 个带 `policy_id/version/section/offset` 的证据片段。
 
 回答中的政策结论必须映射到至少一个证据片段。最终资格判断仍由 `check_eligibility` 工具按确定性规则计算，避免 LLM 独立决定交易资格。
+
+每条证据同时携带检索时冻结的适用性元数据与规范引用 ID；Verifier 只接受与本次检索证据精确匹配的 `policy_refs`。优惠上限等数值约束读取类型化元数据，不从自然语言正文解析。Chunk ID 由策略版本、Section、字节偏移和内容哈希确定，以支持稳定引用和重复导入。
 
 ### 5.4 Typed Planner
 
@@ -149,6 +154,8 @@ Planner 只输出经过 JSON Schema 约束的计划：
 ```
 
 Planner 不能输出任意代码、Shell 命令、SQL 或未注册工具名。
+
+Phase 2 使用受限同步执行器验证检索、规划和工具链路：只允许纯只读计划，或不包含任何高风险步骤且至多含一个普通写步骤的计划。执行器在第一次 MCP 调用前对完整计划预检；计划只要包含高风险步骤就以 `waiting_runtime` 停止且不产生任何工具副作用，等待 Phase 3 的持久化审批 Runtime。
 
 ### 5.5 Plan Verifier
 
