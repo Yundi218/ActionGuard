@@ -1,4 +1,4 @@
-.PHONY: test vet db-up db-down api mcp fixtures test-integration demo-up
+.PHONY: test vet db-up db-down api mcp fixtures policies test-integration demo-up
 
 test:
 	go test -p 1 ./...
@@ -20,6 +20,9 @@ mcp:
 
 fixtures:
 	DATABASE_URL=$${DATABASE_URL} bash scripts/load-fixtures.sh
+
+policies:
+	go run ./cmd/policy-import
 
 test-integration:
 	@test -n "$${DATABASE_URL}" || (printf 'error: DATABASE_URL is required\n' >&2; exit 1)
