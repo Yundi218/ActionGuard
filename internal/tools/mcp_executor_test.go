@@ -510,6 +510,38 @@ func TestNewMCPExecutorCancellationPrecedesOversizedInitialize(t *testing.T) {
 	}
 }
 
+func TestConnectContextBridgeDropsCallerValuesAndReleasesResources(t *testing.T) {
+	callerValueKey := &struct{ name string }{name: "caller-value"}
+	deadline := time.Now().Add(time.Hour)
+	caller := &trackingAfterFuncContext{
+		deadline: deadline,
+		done:     make(chan struct{}),
+		valueKey: callerValueKey,
+		value:    bytes.Repeat([]byte("s"), 1024),
+		stopped:  make(chan struct{}),
+	}
+
+	bridge, cleanup := newConnectContextBridge(caller)
+	if got := bridge.Value(callerValueKey); got != nil {
+		t.Fatalf("bridge caller value = %#v, want nil", got)
+	}
+	if got, ok := bridge.Deadline(); !ok || !got.Equal(deadline) {
+		t.Fatalf("bridge deadline = %v, %t; want %v, true", got, ok, deadline)
+	}
+
+	cleanup()
+	select {
+	case <-caller.stopped:
+	default:
+		t.Fatal("bridge cleanup did not release caller cancellation callback")
+	}
+	select {
+	case <-bridge.Done():
+	default:
+		t.Fatal("bridge cleanup did not cancel the bridge deadline context")
+	}
+}
+
 func TestNewMCPExecutorBoundsFailedInitializeCleanupWithCallerDeadline(t *testing.T) {
 	server := mcp.NewServer(&mcp.Implementation{Name: "bounded-initialize-cleanup", Version: "v1"}, nil)
 	handler := mcp.NewStreamableHTTPHandler(
@@ -518,8 +550,10 @@ func TestNewMCPExecutorBoundsFailedInitializeCleanupWithCallerDeadline(t *testin
 	)
 	testServer := httptest.NewServer(handler)
 	t.Cleanup(testServer.Close)
-	transport := newCleanupDeadlineTransport(http.DefaultTransport, true, oversizedStreamed)
-	deadlineContext, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	callerValueKey := &struct{ name string }{name: "failed-initialize-caller-value"}
+	transport := newCleanupDeadlineTransport(http.DefaultTransport, true, oversizedStreamed, callerValueKey)
+	valueContext := context.WithValue(context.Background(), callerValueKey, "must-not-reach-transport")
+	deadlineContext, cancel := context.WithTimeout(valueContext, 25*time.Millisecond)
 	defer cancel()
 	callerContext := toolkit.WithCallContext(deadlineContext, toolkit.CallContext{
 		RunID: "caller-run", StepID: "caller-step", UserID: "caller-user",
@@ -540,6 +574,7 @@ func TestNewMCPExecutorBoundsFailedInitializeCleanupWithCallerDeadline(t *testin
 	}
 	transport.requireFinished(t)
 	transport.requireNoTrustedHeaders(t)
+	transport.requireNoCallerValues(t)
 	transport.requireInitializeBodyClosed(t)
 }
 
@@ -551,8 +586,10 @@ func TestCanceledConstructorContextDoesNotAbortBoundedNormalClose(t *testing.T) 
 	)
 	testServer := httptest.NewServer(handler)
 	t.Cleanup(testServer.Close)
-	transport := newCleanupDeadlineTransport(http.DefaultTransport, false, oversizedDeclared)
-	constructorContext, cancelConstructor := context.WithCancel(context.Background())
+	callerValueKey := &struct{ name string }{name: "successful-initialize-caller-value"}
+	transport := newCleanupDeadlineTransport(http.DefaultTransport, false, oversizedDeclared, callerValueKey)
+	valueContext := context.WithValue(context.Background(), callerValueKey, "must-not-reach-transport")
+	constructorContext, cancelConstructor := context.WithCancel(valueContext)
 	callerContext := toolkit.WithCallContext(constructorContext, toolkit.CallContext{
 		RunID: "caller-run", StepID: "caller-step", UserID: "caller-user",
 		Scopes: []string{"admin"}, IdempotencyKey: "caller-key",
@@ -583,6 +620,7 @@ func TestCanceledConstructorContextDoesNotAbortBoundedNormalClose(t *testing.T) 
 		t.Fatalf("normal DELETE began with canceled context: %v", initialErr)
 	}
 	transport.requireNoTrustedHeaders(t)
+	transport.requireNoCallerValues(t)
 }
 
 func TestExecutorCancellationTakesPriorityOverOversizedResponse(t *testing.T) {
@@ -848,17 +886,21 @@ type cleanupDeadlineTransport struct {
 	mu                   sync.Mutex
 	initializeHeaders    http.Header
 	deleteHeaders        http.Header
+	callerValueKey       any
+	initializeValue      any
+	deleteValue          any
 	deleteInitialErr     error
 	enterOnce            sync.Once
 	exitOnce             sync.Once
 	bodyCloseOnce        sync.Once
 }
 
-func newCleanupDeadlineTransport(next http.RoundTripper, oversizedInitialize bool, mode oversizedResponseMode) *cleanupDeadlineTransport {
+func newCleanupDeadlineTransport(next http.RoundTripper, oversizedInitialize bool, mode oversizedResponseMode, callerValueKey any) *cleanupDeadlineTransport {
 	return &cleanupDeadlineTransport{
 		next: next, oversizedInitialize: oversizedInitialize, mode: mode,
 		deleteEntered: make(chan struct{}), deleteExited: make(chan struct{}),
 		initializeBodyClosed: make(chan struct{}),
+		callerValueKey:       callerValueKey,
 	}
 }
 
@@ -866,6 +908,7 @@ func (transport *cleanupDeadlineTransport) RoundTrip(request *http.Request) (*ht
 	if request.Method == http.MethodDelete {
 		transport.mu.Lock()
 		transport.deleteHeaders = request.Header.Clone()
+		transport.deleteValue = request.Context().Value(transport.callerValueKey)
 		transport.deleteInitialErr = request.Context().Err()
 		transport.mu.Unlock()
 		transport.enterOnce.Do(func() { close(transport.deleteEntered) })
@@ -889,6 +932,7 @@ func (transport *cleanupDeadlineTransport) RoundTrip(request *http.Request) (*ht
 		if initialize {
 			transport.mu.Lock()
 			transport.initializeHeaders = request.Header.Clone()
+			transport.initializeValue = request.Context().Value(transport.callerValueKey)
 			transport.mu.Unlock()
 		}
 	}
@@ -912,6 +956,20 @@ func (transport *cleanupDeadlineTransport) RoundTrip(request *http.Request) (*ht
 		response.Header.Del("Content-Length")
 	}
 	return response, nil
+}
+
+func (transport *cleanupDeadlineTransport) requireNoCallerValues(t *testing.T) {
+	t.Helper()
+	transport.mu.Lock()
+	initializeValue := transport.initializeValue
+	deleteValue := transport.deleteValue
+	transport.mu.Unlock()
+	if initializeValue != nil {
+		t.Fatalf("initialize transport context leaked caller value %#v", initializeValue)
+	}
+	if deleteValue != nil {
+		t.Fatalf("DELETE transport context leaked caller value %#v", deleteValue)
+	}
 }
 
 func (transport *cleanupDeadlineTransport) requireFinished(t *testing.T) {
@@ -959,6 +1017,37 @@ func (transport *cleanupDeadlineTransport) deleteInitialContextError() error {
 	transport.mu.Lock()
 	defer transport.mu.Unlock()
 	return transport.deleteInitialErr
+}
+
+type trackingAfterFuncContext struct {
+	deadline time.Time
+	done     chan struct{}
+	valueKey any
+	value    any
+	stopped  chan struct{}
+	stopOnce sync.Once
+}
+
+func (ctx *trackingAfterFuncContext) Deadline() (time.Time, bool) { return ctx.deadline, true }
+func (ctx *trackingAfterFuncContext) Done() <-chan struct{}       { return ctx.done }
+func (*trackingAfterFuncContext) Err() error                      { return nil }
+
+func (ctx *trackingAfterFuncContext) Value(key any) any {
+	if key == ctx.valueKey {
+		return ctx.value
+	}
+	return nil
+}
+
+func (ctx *trackingAfterFuncContext) AfterFunc(func()) func() bool {
+	return func() bool {
+		stopped := false
+		ctx.stopOnce.Do(func() {
+			stopped = true
+			close(ctx.stopped)
+		})
+		return stopped
+	}
 }
 
 type observedReadCloser struct {

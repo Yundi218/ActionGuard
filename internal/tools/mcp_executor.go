@@ -60,24 +60,35 @@ func NewMCPExecutor(ctx context.Context, config MCPConfig) (*MCPExecutor, error)
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return ErrMCPRedirect }
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "actionguard-executor", Version: "v0.2.0"}, nil)
-	connectContext, responseState := withConnectResponseLimitState(valueFreeContext{Context: ctx})
+	connectBridge, cleanupConnectBridge := newConnectContextBridge(ctx)
+	connectContext, responseState := withConnectResponseLimitState(connectBridge)
 	session, err := client.Connect(connectContext, &mcp.StreamableClientTransport{
 		Endpoint: endpoint, HTTPClient: &clientCopy, MaxRetries: -1, DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
-		return nil, classifyTransportError(ctx, responseState, err)
+		classified := classifyConnectTransportError(ctx, connectBridge, responseState, err)
+		cleanupConnectBridge()
+		return nil, classified
 	}
 	responseState.initializing.Store(false)
+	cleanupConnectBridge()
 	return &MCPExecutor{session: session}, nil
 }
 
-// valueFreeContext preserves connection cancellation and deadlines without
-// allowing a caller-provided tool context to reach MCP initialization.
-type valueFreeContext struct {
-	context.Context
+func newConnectContextBridge(caller context.Context) (context.Context, func()) {
+	var bridge context.Context
+	var cancel context.CancelFunc
+	if deadline, ok := caller.Deadline(); ok {
+		bridge, cancel = context.WithDeadline(context.Background(), deadline)
+	} else {
+		bridge, cancel = context.WithCancel(context.Background())
+	}
+	stopForwarding := context.AfterFunc(caller, cancel)
+	return bridge, sync.OnceFunc(func() {
+		stopForwarding()
+		cancel()
+	})
 }
-
-func (valueFreeContext) Value(any) any { return nil }
 
 func validateEndpoint(raw string) (string, error) {
 	parsed, err := url.Parse(raw)
@@ -179,6 +190,19 @@ func (executor *MCPExecutor) Execute(ctx context.Context, request ExecutionReque
 func classifyTransportError(ctx context.Context, state *responseLimitState, err error) error {
 	if classified := classifyResponseState(ctx, state); classified != nil {
 		return classified
+	}
+	return sanitizeTransportError(nil, err)
+}
+
+func classifyConnectTransportError(caller, bridge context.Context, state *responseLimitState, err error) error {
+	if callerErr := caller.Err(); callerErr != nil {
+		return callerErr
+	}
+	if bridgeErr := bridge.Err(); bridgeErr != nil {
+		return bridgeErr
+	}
+	if state != nil && state.tooLarge.Load() {
+		return ErrMCPResponseTooLarge
 	}
 	return sanitizeTransportError(nil, err)
 }
