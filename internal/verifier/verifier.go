@@ -595,15 +595,11 @@ func normalizeForSchema(value any, schema *jsonschema.Schema) (any, error) {
 
 func normalizeJSONNumber(number json.Number, schema *jsonschema.Schema) (any, error) {
 	if schemaAcceptsType(schema, "integer") {
-		value, _, err := big.ParseFloat(number.String(), 10, 256, big.ToNearestEven)
-		if err != nil {
-			return nil, err
-		}
-		integer, accuracy := value.Int(nil)
-		if accuracy != big.Exact || !integer.IsInt64() {
+		value, ok := new(big.Rat).SetString(number.String())
+		if !ok || value.Denom().Cmp(big.NewInt(1)) != 0 || !value.Num().IsInt64() {
 			return nil, errors.New("number is not an exact int64")
 		}
-		return integer.Int64(), nil
+		return value.Num().Int64(), nil
 	}
 	value, err := number.Float64()
 	if err != nil {

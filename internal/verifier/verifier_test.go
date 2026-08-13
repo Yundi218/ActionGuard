@@ -275,6 +275,55 @@ func TestValidateArgumentsHonorsNumericAndNestedSchemaKeywords(t *testing.T) {
 	}
 }
 
+func TestValidateArgumentsNormalizesExactJSONIntegers(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"value":{"type":"integer"}},"required":["value"],"additionalProperties":false}`)
+	valid := []struct {
+		name      string
+		number    string
+		canonical string
+	}{
+		{name: "integer", number: "500", canonical: `{"value":500}`},
+		{name: "decimal integer", number: "500.0", canonical: `{"value":500}`},
+		{name: "exponent integer", number: "5e2", canonical: `{"value":500}`},
+		{name: "maximum int64", number: "9223372036854775807", canonical: `{"value":9223372036854775807}`},
+		{name: "minimum int64", number: "-9223372036854775808", canonical: `{"value":-9223372036854775808}`},
+		{name: "maximum int64 exponent", number: "9.223372036854775807e18", canonical: `{"value":9223372036854775807}`},
+		{name: "minimum int64 exponent", number: "-9.223372036854775808e18", canonical: `{"value":-9223372036854775808}`},
+	}
+	for _, tt := range valid {
+		t.Run(tt.name, func(t *testing.T) {
+			validated, err := validateArguments(json.RawMessage(`{"value":`+tt.number+`}`), schema)
+			if err != nil {
+				t.Fatalf("validateArguments() error = %v, want valid", err)
+			}
+			if validated.canonical != tt.canonical {
+				t.Fatalf("canonical = %s, want %s", validated.canonical, tt.canonical)
+			}
+		})
+	}
+
+	invalid := []struct {
+		name   string
+		number string
+	}{
+		{name: "reviewer long fractional tail", number: "1500." + strings.Repeat("0", 80) + "1"},
+		{name: "positive overflow", number: "9223372036854775808"},
+		{name: "negative overflow", number: "-9223372036854775809"},
+		{name: "exponent overflow", number: "9.223372036854775808e18"},
+		{name: "fractional exponent", number: "5e-1"},
+		{name: "truncated exponent", number: "1e"},
+		{name: "leading zero", number: "01"},
+		{name: "double sign", number: "--1"},
+	}
+	for _, tt := range invalid {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := validateArguments(json.RawMessage(`{"value":`+tt.number+`}`), schema); err == nil {
+				t.Fatal("validateArguments() error = nil, want exact integer rejection")
+			}
+		})
+	}
+}
+
 func TestVerifierReturnsStableRepairErrorForMissingScope(t *testing.T) {
 	plan, verificationContext, reader := validReplacementFixture()
 	verificationContext.Scopes = []string{"order:read", "eligibility:read", "inventory:read"}
