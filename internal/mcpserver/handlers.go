@@ -195,10 +195,13 @@ func issueCouponHandler(svc *commerce.Service, contract toolContract) mcp.ToolHa
 func validateCall(ctx context.Context, contract toolContract) (toolkit.CallContext, error) {
 	meta, err := toolkit.FromContext(ctx)
 	if err != nil {
-		return toolkit.CallContext{}, err
+		return toolkit.CallContext{}, commerce.ErrInvalidToolContext
 	}
 	if err := meta.Validate(contract.Risk); err != nil {
-		return toolkit.CallContext{}, err
+		if contract.Risk != toolkit.Read && meta.IdempotencyKey == "" {
+			return toolkit.CallContext{}, commerce.ErrIdempotencyKey
+		}
+		return toolkit.CallContext{}, commerce.ErrInvalidToolContext
 	}
 	if !meta.HasScope(contract.Scope) {
 		return toolkit.CallContext{}, commerce.ErrForbidden

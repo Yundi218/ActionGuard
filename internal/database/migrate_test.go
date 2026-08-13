@@ -131,6 +131,95 @@ func TestMigrateCreatesCommerceSchema(t *testing.T) {
 		"shipments|shipments_pkey|id",
 		"users|users_pkey|id",
 	})
+
+	requireColumnNullability(t, pool, schema, "idempotency_records", []string{
+		"created_at|NO",
+		"idempotency_key|NO",
+		"operation|NO",
+		"principal_id|NO",
+		"request_fingerprint|NO",
+		"result_id|NO",
+		"result_type|NO",
+	})
+}
+
+func TestMigrateUpgradesLegacyIdempotencyRecordsIdempotently(t *testing.T) {
+	databaseURL := os.Getenv("TEST_DATABASE_URL")
+	if databaseURL == "" {
+		t.Skip("TEST_DATABASE_URL is not set")
+	}
+
+	ctx := context.Background()
+	adminPool, err := Open(ctx, databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(adminPool.Close)
+
+	schema := fmt.Sprintf("legacy_idempotency_%d", time.Now().UnixNano())
+	if _, err := adminPool.Exec(ctx, "create schema "+schema); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if _, err := adminPool.Exec(ctx, "drop schema "+schema+" cascade"); err != nil {
+			t.Errorf("drop schema %s: %v", schema, err)
+		}
+	})
+	if _, err := adminPool.Exec(ctx, `
+		create table `+schema+`.idempotency_records (
+			operation text not null,
+			idempotency_key text not null,
+			result_type text not null,
+			result_id text not null,
+			created_at timestamptz not null default now(),
+			primary key (operation, idempotency_key)
+		);
+		insert into `+schema+`.idempotency_records (operation, idempotency_key, result_type, result_id)
+		values ('create_return', 'legacy-key', 'return', 'legacy-id');
+	`); err != nil {
+		t.Fatal(err)
+	}
+
+	migrationURL, err := url.Parse(databaseURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := migrationURL.Query()
+	query.Set("search_path", schema+",public")
+	migrationURL.RawQuery = query.Encode()
+	pool, err := Open(ctx, migrationURL.String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatal(err)
+	}
+	if err := Migrate(ctx, pool); err != nil {
+		t.Fatalf("second migration: %v", err)
+	}
+	requireColumnNullability(t, pool, schema, "idempotency_records", []string{
+		"created_at|NO",
+		"idempotency_key|NO",
+		"operation|NO",
+		"principal_id|NO",
+		"request_fingerprint|NO",
+		"result_id|NO",
+		"result_type|NO",
+	})
+
+	var principalID, fingerprint string
+	if err := pool.QueryRow(ctx, `
+		select principal_id, request_fingerprint
+		from idempotency_records
+		where operation = 'create_return' and idempotency_key = 'legacy-key'
+	`).Scan(&principalID, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if principalID == "" || len(fingerprint) != 64 {
+		t.Fatalf("legacy binding = principal %q fingerprint %q", principalID, fingerprint)
+	}
 }
 
 func requireConstraintSet(t *testing.T, pool *pgxpool.Pool, schema, constraintType, name string, want []string) {
@@ -198,5 +287,35 @@ func requireUniqueIndexSet(t *testing.T, pool *pgxpool.Pool, schema string, want
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("unique indexes =\n%s\nwant:\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+}
+
+func requireColumnNullability(t *testing.T, pool *pgxpool.Pool, schema, table string, want []string) {
+	t.Helper()
+
+	rows, err := pool.Query(context.Background(), `
+		select column_name || '|' || is_nullable
+		from information_schema.columns
+		where table_schema = $1 and table_name = $2
+		order by column_name
+	`, schema, table)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+
+	var got []string
+	for rows.Next() {
+		var column string
+		if err := rows.Scan(&column); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, column)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("%s columns =\n%s\nwant:\n%s", table, strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
 }

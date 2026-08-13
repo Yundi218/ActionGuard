@@ -216,6 +216,12 @@ RUNNING -> COMPENSATING -> COMPENSATED
 
 Simulator 使用 PostgreSQL 保存用户、订单、商品、库存、物流、退货、换货、退款、优惠券和幂等记录。所有数据由 Fixture 生成，名称、地址、订单和支付信息均为虚构内容。
 
+Phase 1 的写入合同使用类型化 `IdempotencyIdentity`，包含操作名、幂等键、受信任 Principal，以及对该操作类型化请求结构执行规范 JSON 编码后得到的 SHA-256 指纹。指纹覆盖 Principal 和所有有业务语义的参数。相同操作与键只有在 Principal 和指纹都完全一致时才返回原资源；任何差异都返回稳定的 `ErrIdempotencyConflict`，不返回原资源标识，也不执行副作用。
+
+Service 在可用时先查询精确 Replay，再执行所有权和业务规则预检；预检失败前再次查询 Replay，以覆盖并发提交竞态。PostgreSQL Store 的写事务仍是最终权威：它先获取同一操作与键的事务级 Advisory Lock，再比较幂等记录，然后才锁定订单、退款余额或库存行并重新检查可变条件。这样最后一件库存、全额退款和 30 天窗口到期后仍可安全重放，同时不同键的并发请求不能突破余额或库存约束。
+
+MCP 边界只向 Agent 返回明确的稳定领域错误白名单。未预期的数据库、Schema 或网络错误以工具名记录在服务端，并统一返回不包含内部细节的 `ErrInternalTool`。
+
 Simulator 支持通过测试控制接口注入：
 
 - 指定工具超时。

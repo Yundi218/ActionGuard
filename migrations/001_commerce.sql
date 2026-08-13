@@ -73,8 +73,26 @@ create table if not exists coupons (
 create table if not exists idempotency_records (
   operation text not null,
   idempotency_key text not null,
+  principal_id text not null,
+  request_fingerprint text not null,
   result_type text not null,
   result_id text not null,
   created_at timestamptz not null default now(),
   primary key (operation, idempotency_key)
 );
+
+alter table idempotency_records
+  add column if not exists principal_id text,
+  add column if not exists request_fingerprint text;
+
+update idempotency_records
+set principal_id = '__legacy_unbound__'
+where principal_id is null;
+
+update idempotency_records
+set request_fingerprint = repeat('0', 64)
+where request_fingerprint is null;
+
+alter table idempotency_records
+  alter column principal_id set not null,
+  alter column request_fingerprint set not null;

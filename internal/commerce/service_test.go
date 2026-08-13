@@ -23,6 +23,9 @@ type fakeStore struct {
 	replacementErr error
 	refundErr      error
 	couponErr      error
+	replayErr      error
+	replayResult   WriteResult
+	replayed       bool
 
 	getOrderIDs    []string
 	shipmentOrders []string
@@ -31,6 +34,7 @@ type fakeStore struct {
 	replaceCalls   []replacementCall
 	refundCalls    []refundCall
 	couponCalls    []couponCall
+	replayCalls    []IdempotencyIdentity
 
 	getOrderContexts    []context.Context
 	shipmentContexts    []context.Context
@@ -39,6 +43,7 @@ type fakeStore struct {
 	replacementContexts []context.Context
 	refundContexts      []context.Context
 	couponContexts      []context.Context
+	replayContexts      []context.Context
 }
 
 type returnCall struct {
@@ -94,8 +99,17 @@ func (f *fakeStore) GetInventory(ctx context.Context, sku string) (Inventory, er
 	return f.inventory, nil
 }
 
-func (f *fakeStore) CreateReturn(ctx context.Context, orderID, reason, idempotencyKey string) (WriteResult, error) {
-	f.returnCalls = append(f.returnCalls, returnCall{orderID, reason, idempotencyKey})
+func (f *fakeStore) ReplayWrite(ctx context.Context, identity IdempotencyIdentity) (WriteResult, bool, error) {
+	f.replayCalls = append(f.replayCalls, identity)
+	f.replayContexts = append(f.replayContexts, ctx)
+	if f.replayErr != nil {
+		return WriteResult{}, false, fmt.Errorf("replay write: %w", f.replayErr)
+	}
+	return f.replayResult, f.replayed, nil
+}
+
+func (f *fakeStore) CreateReturn(ctx context.Context, identity IdempotencyIdentity, orderID, reason string, _ time.Time) (WriteResult, error) {
+	f.returnCalls = append(f.returnCalls, returnCall{orderID, reason, identity.Key})
 	f.returnContexts = append(f.returnContexts, ctx)
 	if f.returnErr != nil {
 		return WriteResult{}, fmt.Errorf("create return: %w", f.returnErr)
@@ -103,8 +117,8 @@ func (f *fakeStore) CreateReturn(ctx context.Context, orderID, reason, idempoten
 	return f.result, nil
 }
 
-func (f *fakeStore) CreateReplacement(ctx context.Context, orderID, sku, reason, idempotencyKey string) (WriteResult, error) {
-	f.replaceCalls = append(f.replaceCalls, replacementCall{orderID, sku, reason, idempotencyKey})
+func (f *fakeStore) CreateReplacement(ctx context.Context, identity IdempotencyIdentity, orderID, sku, reason string, _ time.Time) (WriteResult, error) {
+	f.replaceCalls = append(f.replaceCalls, replacementCall{orderID, sku, reason, identity.Key})
 	f.replacementContexts = append(f.replacementContexts, ctx)
 	if f.replacementErr != nil {
 		return WriteResult{}, fmt.Errorf("create replacement: %w", f.replacementErr)
@@ -112,8 +126,8 @@ func (f *fakeStore) CreateReplacement(ctx context.Context, orderID, sku, reason,
 	return f.result, nil
 }
 
-func (f *fakeStore) IssueRefund(ctx context.Context, orderID string, amountCents int64, idempotencyKey string) (WriteResult, error) {
-	f.refundCalls = append(f.refundCalls, refundCall{orderID, amountCents, idempotencyKey})
+func (f *fakeStore) IssueRefund(ctx context.Context, identity IdempotencyIdentity, orderID string, amountCents int64) (WriteResult, error) {
+	f.refundCalls = append(f.refundCalls, refundCall{orderID, amountCents, identity.Key})
 	f.refundContexts = append(f.refundContexts, ctx)
 	if f.refundErr != nil {
 		return WriteResult{}, fmt.Errorf("issue refund: %w", f.refundErr)
@@ -121,8 +135,8 @@ func (f *fakeStore) IssueRefund(ctx context.Context, orderID string, amountCents
 	return f.result, nil
 }
 
-func (f *fakeStore) IssueCoupon(ctx context.Context, userID string, amountCents int64, reason, idempotencyKey string) (WriteResult, error) {
-	f.couponCalls = append(f.couponCalls, couponCall{userID, amountCents, reason, idempotencyKey})
+func (f *fakeStore) IssueCoupon(ctx context.Context, identity IdempotencyIdentity, amountCents int64, reason string) (WriteResult, error) {
+	f.couponCalls = append(f.couponCalls, couponCall{identity.PrincipalID, amountCents, reason, identity.Key})
 	f.couponContexts = append(f.couponContexts, ctx)
 	if f.couponErr != nil {
 		return WriteResult{}, fmt.Errorf("issue coupon: %w", f.couponErr)
@@ -326,6 +340,49 @@ func TestServiceIssueCouponEnforcesPhaseOneLimitsAndForwardsArguments(t *testing
 				t.Fatalf("calls = %#v", store.couponCalls)
 			}
 		})
+	}
+}
+
+func TestServiceExactReplayPrecedesMutablePreconditions(t *testing.T) {
+	want := WriteResult{ResourceType: "existing", ResourceID: "existing-id", Status: "created", Replayed: true}
+	for _, tt := range []struct {
+		name string
+		call func(*Service) (WriteResult, error)
+	}{
+		{name: "return", call: func(s *Service) (WriteResult, error) {
+			return s.CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "replay-key")
+		}},
+		{name: "replacement", call: func(s *Service) (WriteResult, error) {
+			return s.CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-RED-42", "damaged", "replay-key")
+		}},
+		{name: "refund", call: func(s *Service) (WriteResult, error) {
+			return s.IssueRefund(context.Background(), "user_018", "AG-1042", 12900, "replay-key")
+		}},
+		{name: "coupon", call: func(s *Service) (WriteResult, error) {
+			return s.IssueCoupon(context.Background(), "user_018", 2000, "service recovery", "replay-key")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{replayResult: want, replayed: true}
+			got, err := tt.call(NewService(store))
+			if err != nil || got != want {
+				t.Fatalf("result/error = %#v/%v, want %#v/nil", got, err, want)
+			}
+			if len(store.replayCalls) != 1 || len(store.getOrderIDs) != 0 || len(store.inventorySKUs) != 0 || len(store.returnCalls) != 0 || len(store.replaceCalls) != 0 || len(store.refundCalls) != 0 || len(store.couponCalls) != 0 {
+				t.Fatalf("store calls after replay: replay=%d orders=%v inventory=%v writes=%d/%d/%d/%d", len(store.replayCalls), store.getOrderIDs, store.inventorySKUs, len(store.returnCalls), len(store.replaceCalls), len(store.refundCalls), len(store.couponCalls))
+			}
+		})
+	}
+}
+
+func TestServiceIdempotencyConflictPrecedesOwnershipChecks(t *testing.T) {
+	store := &fakeStore{replayErr: ErrIdempotencyConflict}
+	result, err := NewService(store).CreateReturn(context.Background(), "other-user", "AG-1042", "damaged", "conflict-key")
+	if !errors.Is(err, ErrIdempotencyConflict) || result != (WriteResult{}) {
+		t.Fatalf("result/error = %#v/%v", result, err)
+	}
+	if len(store.getOrderIDs) != 0 || len(store.returnCalls) != 0 {
+		t.Fatalf("conflict reached ownership or write: orders=%v writes=%v", store.getOrderIDs, store.returnCalls)
 	}
 }
 

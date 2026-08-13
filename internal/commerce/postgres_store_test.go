@@ -4,12 +4,25 @@ import (
 	"context"
 	"errors"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Yundi218/ActionGuard/internal/database"
+	"github.com/Yundi218/ActionGuard/internal/testdatabase"
 )
+
+var postgresStoreTestTime = time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+
+func postgresStoreTestIdentity(operation, key string) IdempotencyIdentity {
+	return IdempotencyIdentity{
+		Operation:          operation,
+		Key:                key,
+		PrincipalID:        "user_018",
+		RequestFingerprint: strings.Repeat("a", 64),
+	}
+}
 
 func newTestStore(t *testing.T) *PostgresStore {
 	t.Helper()
@@ -25,6 +38,19 @@ func newTestStore(t *testing.T) *PostgresStore {
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
+	lockCtx, cancelLock := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelLock()
+	lock, err := testdatabase.AcquirePublicSchemaLock(lockCtx, pool)
+	if err != nil {
+		t.Fatalf("acquire public-schema test lock: %v", err)
+	}
+	t.Cleanup(func() {
+		releaseCtx, cancelRelease := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelRelease()
+		if err := lock.Release(releaseCtx); err != nil {
+			t.Errorf("release public-schema test lock: %v", err)
+		}
+	})
 
 	if err := database.Migrate(ctx, pool); err != nil {
 		t.Fatal(err)
@@ -81,11 +107,12 @@ func TestPostgresStoreReadsShipmentAndInventory(t *testing.T) {
 func TestPostgresStoreCreateReturnIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
 
-	first, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "return-key-1")
+	identity := postgresStoreTestIdentity(createReturnOperation, "return-key-1")
+	first, err := store.CreateReturn(context.Background(), identity, "AG-1042", "damaged", postgresStoreTestTime)
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "return-key-1")
+	second, err := store.CreateReturn(context.Background(), identity, "AG-1042", "damaged", postgresStoreTestTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,7 +128,7 @@ func TestPostgresStoreCreateReturnIsIdempotent(t *testing.T) {
 func TestPostgresStoreCreateReturnRejectsEmptyIdempotencyKey(t *testing.T) {
 	store := newTestStore(t)
 
-	_, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "")
+	_, err := store.CreateReturn(context.Background(), postgresStoreTestIdentity(createReturnOperation, ""), "AG-1042", "damaged", postgresStoreTestTime)
 	if !errors.Is(err, ErrIdempotencyKey) {
 		t.Fatalf("err = %v", err)
 	}
@@ -118,21 +145,21 @@ func TestPostgresStoreWritesPrioritizeEmptyIdempotencyKey(t *testing.T) {
 		{
 			name: "replacement",
 			call: func() error {
-				_, err := store.CreateReplacement(ctx, "AG-1042", "SKU-RED-42", "damaged", "")
+				_, err := store.CreateReplacement(ctx, postgresStoreTestIdentity(createReplacementOperation, ""), "AG-1042", "SKU-RED-42", "damaged", postgresStoreTestTime)
 				return err
 			},
 		},
 		{
 			name: "refund",
 			call: func() error {
-				_, err := store.IssueRefund(ctx, "AG-1042", 0, "")
+				_, err := store.IssueRefund(ctx, postgresStoreTestIdentity(issueRefundOperation, ""), "AG-1042", 0)
 				return err
 			},
 		},
 		{
 			name: "coupon",
 			call: func() error {
-				_, err := store.IssueCoupon(ctx, "user_018", 0, "service recovery", "")
+				_, err := store.IssueCoupon(ctx, postgresStoreTestIdentity(issueCouponOperation, ""), 0, "service recovery")
 				return err
 			},
 		},
@@ -159,7 +186,7 @@ func TestPostgresStoreCreateReturnSerializesConcurrentSameKey(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			<-start
-			result, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "return-key-concurrent")
+			result, err := store.CreateReturn(context.Background(), postgresStoreTestIdentity(createReturnOperation, "return-key-concurrent"), "AG-1042", "damaged", postgresStoreTestTime)
 			results <- result
 			errs <- err
 		}()
@@ -219,7 +246,7 @@ func TestPostgresStoreCreateReturnWaitsForSameIdempotencyLock(t *testing.T) {
 	}()
 
 	if _, err := lockTx.Exec(ctx, `
-		select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))
+		select pg_advisory_xact_lock(hashtextextended($1, hashtextextended($2, 0)))
 	`, operation, key); err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +272,7 @@ func TestPostgresStoreCreateReturnWaitsForSameIdempotencyLock(t *testing.T) {
 	done := make(chan outcome, 1)
 	go func() {
 		close(started)
-		result, err := store.CreateReturn(ctx, "AG-1042", "damaged", key)
+		result, err := store.CreateReturn(ctx, postgresStoreTestIdentity(createReturnOperation, key), "AG-1042", "damaged", postgresStoreTestTime)
 		done <- outcome{result: result, err: err}
 	}()
 	<-started
@@ -304,7 +331,7 @@ func TestPostgresStoreCreateReturnWaitsForSameIdempotencyLock(t *testing.T) {
 func TestPostgresStoreCreateReplacementReservesInventory(t *testing.T) {
 	store := newTestStore(t)
 
-	result, err := store.CreateReplacement(context.Background(), "AG-1042", "SKU-RED-42", "damaged", "replacement-key-1")
+	result, err := store.CreateReplacement(context.Background(), postgresStoreTestIdentity(createReplacementOperation, "replacement-key-1"), "AG-1042", "SKU-RED-42", "damaged", postgresStoreTestTime)
 	if err != nil || result.ResourceType != "replacement" || result.Status != "created" {
 		t.Fatalf("result = %#v, err = %v", result, err)
 	}
@@ -318,7 +345,7 @@ func TestPostgresStoreCreateReplacementReservesInventory(t *testing.T) {
 func TestPostgresStoreIssueRefundUpdatesOrderBalance(t *testing.T) {
 	store := newTestStore(t)
 
-	result, err := store.IssueRefund(context.Background(), "AG-1042", 800, "refund-key-1")
+	result, err := store.IssueRefund(context.Background(), postgresStoreTestIdentity(issueRefundOperation, "refund-key-1"), "AG-1042", 800)
 	if err != nil || result.ResourceType != "refund" || result.Status != "created" {
 		t.Fatalf("result = %#v, err = %v", result, err)
 	}
@@ -333,7 +360,7 @@ func TestPostgresStoreIssueRefundRollsBackAfterOverRefund(t *testing.T) {
 	store := newTestStore(t)
 	const key = "refund-key-over-limit"
 
-	_, err := store.IssueRefund(context.Background(), "AG-1042", 13000, key)
+	_, err := store.IssueRefund(context.Background(), postgresStoreTestIdentity(issueRefundOperation, key), "AG-1042", 13000)
 	if err == nil {
 		t.Fatal("IssueRefund returned nil error for an over-refund")
 	}
@@ -370,8 +397,379 @@ func TestPostgresStoreIssueRefundRollsBackAfterOverRefund(t *testing.T) {
 func TestPostgresStoreIssueCouponCreatesCoupon(t *testing.T) {
 	store := newTestStore(t)
 
-	result, err := store.IssueCoupon(context.Background(), "user_018", 1200, "service recovery", "coupon-key-1")
+	result, err := store.IssueCoupon(context.Background(), postgresStoreTestIdentity(issueCouponOperation, "coupon-key-1"), 1200, "service recovery")
 	if err != nil || result.ResourceType != "coupon" || result.Status != "created" {
 		t.Fatalf("result = %#v, err = %v", result, err)
+	}
+}
+
+func TestPostgresStoreServiceReplaysReplacementAfterLastUnit(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `update inventory set available = 1 where sku = 'SKU-RED-42'`); err != nil {
+		t.Fatal(err)
+	}
+
+	now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	svc := NewServiceWithClock(store, func() time.Time { return now })
+	first, err := svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-last-unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-last-unit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ResourceID == "" || second.ResourceID != first.ResourceID || !second.Replayed {
+		t.Fatalf("first/second = %#v/%#v", first, second)
+	}
+
+	var replacements, available, reserved int
+	if err := store.pool.QueryRow(ctx, `select count(*) from replacements`).Scan(&replacements); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select available, reserved from inventory where sku = 'SKU-RED-42'`).Scan(&available, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if replacements != 1 || available != 0 || reserved != 1 {
+		t.Fatalf("database state: replacements=%d available=%d reserved=%d", replacements, available, reserved)
+	}
+}
+
+func TestPostgresStoreServiceReplaysFullRefund(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	svc := NewService(store)
+
+	first, err := svc.IssueRefund(ctx, "user_018", "AG-1042", 12900, "refund-full-balance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.IssueRefund(ctx, "user_018", "AG-1042", 12900, "refund-full-balance")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.ResourceID == "" || second.ResourceID != first.ResourceID || !second.Replayed {
+		t.Fatalf("first/second = %#v/%#v", first, second)
+	}
+
+	var refunds int
+	var refunded int64
+	if err := store.pool.QueryRow(ctx, `select count(*) from refunds`).Scan(&refunds); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select refunded_amount_cents from orders where id = 'AG-1042'`).Scan(&refunded); err != nil {
+		t.Fatal(err)
+	}
+	if refunds != 1 || refunded != 12900 {
+		t.Fatalf("database state: refunds=%d refunded=%d", refunds, refunded)
+	}
+}
+
+func TestPostgresStoreServiceReplaysExpiredAfterSalesWrites(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		write    func(context.Context, *Service, string) (WriteResult, error)
+		countSQL string
+		wantType string
+	}{
+		{
+			name: "return",
+			write: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReturn(ctx, "user_018", "AG-1042", "damaged", key)
+			},
+			countSQL: `select count(*) from returns`,
+			wantType: "return",
+		},
+		{
+			name: "replacement",
+			write: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", key)
+			},
+			countSQL: `select count(*) from replacements`,
+			wantType: "replacement",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+			svc := NewServiceWithClock(store, func() time.Time { return now })
+
+			first, err := tt.write(ctx, svc, "expired-replay-"+tt.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = time.Date(2026, 9, 1, 12, 0, 0, 1, time.UTC)
+			second, err := tt.write(ctx, svc, "expired-replay-"+tt.name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.ResourceType != tt.wantType || first.ResourceID == "" || second.ResourceID != first.ResourceID || !second.Replayed {
+				t.Fatalf("first/second = %#v/%#v", first, second)
+			}
+
+			var count int
+			if err := store.pool.QueryRow(ctx, tt.countSQL).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("%s count = %d, want 1", tt.wantType, count)
+			}
+		})
+	}
+}
+
+func TestPostgresStoreConcurrentDifferentKeyRefundsRespectLockedBalance(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, key := range []string{"refund-concurrent-a", "refund-concurrent-b"} {
+		key := key
+		go func() {
+			<-start
+			_, err := store.IssueRefund(ctx, postgresStoreTestIdentity(issueRefundOperation, key), "AG-1042", 8000)
+			errs <- err
+		}()
+	}
+	close(start)
+
+	var successes, invalidAmounts int
+	for range 2 {
+		err := <-errs
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrInvalidAmount):
+			invalidAmounts++
+		default:
+			t.Fatalf("unexpected refund error: %v", err)
+		}
+	}
+	if successes != 1 || invalidAmounts != 1 {
+		t.Fatalf("successes=%d invalid_amounts=%d", successes, invalidAmounts)
+	}
+
+	var refunds, idempotency int
+	var refunded int64
+	if err := store.pool.QueryRow(ctx, `select count(*) from refunds`).Scan(&refunds); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select count(*) from idempotency_records where operation = 'issue_refund'`).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select refunded_amount_cents from orders where id = 'AG-1042'`).Scan(&refunded); err != nil {
+		t.Fatal(err)
+	}
+	if refunds != 1 || idempotency != 1 || refunded != 8000 {
+		t.Fatalf("database state: refunds=%d idempotency=%d refunded=%d", refunds, idempotency, refunded)
+	}
+}
+
+func TestPostgresStoreConcurrentDifferentKeyReplacementsRespectLockedInventory(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `update inventory set available = 1 where sku = 'SKU-RED-42'`); err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	for _, key := range []string{"replacement-concurrent-a", "replacement-concurrent-b"} {
+		key := key
+		go func() {
+			<-start
+			_, err := store.CreateReplacement(ctx, postgresStoreTestIdentity(createReplacementOperation, key), "AG-1042", "SKU-RED-42", "damaged", postgresStoreTestTime)
+			errs <- err
+		}()
+	}
+	close(start)
+
+	var successes, emptyInventory int
+	for range 2 {
+		err := <-errs
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrInventoryEmpty):
+			emptyInventory++
+		default:
+			t.Fatalf("unexpected replacement error: %v", err)
+		}
+	}
+	if successes != 1 || emptyInventory != 1 {
+		t.Fatalf("successes=%d empty_inventory=%d", successes, emptyInventory)
+	}
+
+	var replacements, idempotency, available, reserved int
+	if err := store.pool.QueryRow(ctx, `select count(*) from replacements`).Scan(&replacements); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select count(*) from idempotency_records where operation = 'create_replacement'`).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `select available, reserved from inventory where sku = 'SKU-RED-42'`).Scan(&available, &reserved); err != nil {
+		t.Fatal(err)
+	}
+	if replacements != 1 || idempotency != 1 || available != 0 || reserved != 1 {
+		t.Fatalf("database state: replacements=%d idempotency=%d available=%d reserved=%d", replacements, idempotency, available, reserved)
+	}
+}
+
+func TestPostgresStoreIdempotencyConflictsDoNotLeakOrMutate(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		first    func(context.Context, *Service, string) (WriteResult, error)
+		conflict func(context.Context, *Service, string) (WriteResult, error)
+		countSQL string
+	}{
+		{
+			name: "return changed reason",
+			first: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReturn(ctx, "user_018", "AG-1042", "damaged", key)
+			},
+			conflict: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReturn(ctx, "user_018", "AG-1042", "wrong item", key)
+			},
+			countSQL: `select count(*) from returns`,
+		},
+		{
+			name: "replacement changed reason",
+			first: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", key)
+			},
+			conflict: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "wrong item", key)
+			},
+			countSQL: `select count(*) from replacements`,
+		},
+		{
+			name: "refund changed amount",
+			first: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.IssueRefund(ctx, "user_018", "AG-1042", 800, key)
+			},
+			conflict: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.IssueRefund(ctx, "user_018", "AG-1042", 900, key)
+			},
+			countSQL: `select count(*) from refunds`,
+		},
+		{
+			name: "coupon changed reason",
+			first: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.IssueCoupon(ctx, "user_018", 1200, "service recovery", key)
+			},
+			conflict: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.IssueCoupon(ctx, "user_018", 1200, "different reason", key)
+			},
+			countSQL: `select count(*) from coupons`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+			svc := NewServiceWithClock(store, func() time.Time { return now })
+			key := "argument-conflict-" + tt.name
+
+			first, err := tt.first(ctx, svc, key)
+			if err != nil {
+				t.Fatal(err)
+			}
+			conflict, err := tt.conflict(ctx, svc, key)
+			if !errors.Is(err, ErrIdempotencyConflict) {
+				t.Fatalf("conflict result/error = %#v/%v, want ErrIdempotencyConflict", conflict, err)
+			}
+			if conflict != (WriteResult{}) {
+				t.Fatalf("conflict leaked result %#v; original resource was %q", conflict, first.ResourceID)
+			}
+
+			var count int
+			if err := store.pool.QueryRow(ctx, tt.countSQL).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 {
+				t.Fatalf("side-effect count = %d, want 1", count)
+			}
+		})
+	}
+}
+
+func TestPostgresStoreIdempotencyConflictsAcrossPrincipalsDoNotLeakOrMutate(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	svc := NewService(store)
+	const key = "coupon-principal-conflict"
+
+	first, err := svc.IssueCoupon(ctx, "user_018", 1200, "service recovery", key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	conflict, err := svc.IssueCoupon(ctx, "user_999", 1200, "service recovery", key)
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("conflict result/error = %#v/%v, want ErrIdempotencyConflict", conflict, err)
+	}
+	if conflict != (WriteResult{}) {
+		t.Fatalf("conflict leaked result %#v; original resource was %q", conflict, first.ResourceID)
+	}
+
+	var coupons int
+	if err := store.pool.QueryRow(ctx, `select count(*) from coupons`).Scan(&coupons); err != nil {
+		t.Fatal(err)
+	}
+	if coupons != 1 {
+		t.Fatalf("coupon count = %d, want 1", coupons)
+	}
+}
+
+func TestPostgresStoreMapsExpectedTransactionalConditions(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		call func(context.Context, *PostgresStore) error
+		want error
+	}{
+		{
+			name: "missing coupon principal",
+			call: func(ctx context.Context, store *PostgresStore) error {
+				identity := postgresStoreTestIdentity(issueCouponOperation, "missing-principal")
+				identity.PrincipalID = "missing-user"
+				_, err := store.IssueCoupon(ctx, identity, 100, "service recovery")
+				return err
+			},
+			want: ErrNotFound,
+		},
+		{
+			name: "wrong order principal",
+			call: func(ctx context.Context, store *PostgresStore) error {
+				identity := postgresStoreTestIdentity(createReturnOperation, "wrong-principal")
+				identity.PrincipalID = "user_999"
+				_, err := store.CreateReturn(ctx, identity, "AG-1042", "damaged", postgresStoreTestTime)
+				return err
+			},
+			want: ErrForbidden,
+		},
+		{
+			name: "missing replacement inventory",
+			call: func(ctx context.Context, store *PostgresStore) error {
+				_, err := store.CreateReplacement(ctx, postgresStoreTestIdentity(createReplacementOperation, "missing-inventory"), "AG-1042", "MISSING-SKU", "damaged", postgresStoreTestTime)
+				return err
+			},
+			want: ErrNotFound,
+		},
+		{
+			name: "expired return",
+			call: func(ctx context.Context, store *PostgresStore) error {
+				_, err := store.CreateReturn(ctx, postgresStoreTestIdentity(createReturnOperation, "expired-return"), "AG-1042", "damaged", time.Date(2026, 9, 1, 12, 0, 0, 1, time.UTC))
+				return err
+			},
+			want: ErrIneligible,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			if err := tt.call(context.Background(), store); !errors.Is(err, tt.want) {
+				t.Fatalf("error = %v, want %v", err, tt.want)
+			}
+		})
 	}
 }

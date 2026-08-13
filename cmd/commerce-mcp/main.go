@@ -10,6 +10,7 @@ import (
 	"github.com/Yundi218/ActionGuard/internal/commerce"
 	"github.com/Yundi218/ActionGuard/internal/config"
 	"github.com/Yundi218/ActionGuard/internal/database"
+	"github.com/Yundi218/ActionGuard/internal/httpserver"
 	"github.com/Yundi218/ActionGuard/internal/mcpserver"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -34,7 +35,7 @@ func main() {
 	svc := commerce.NewService(commerce.NewPostgresStore(pool))
 	handler := newMCPHandler(mcpserver.New(svc), cfg.MCPGatewayToken)
 	log.Printf("commerce MCP listening on %s/mcp", cfg.MCPAddr)
-	log.Fatal(http.ListenAndServe(cfg.MCPAddr, handler))
+	log.Fatal(httpserver.New(cfg.MCPAddr, handler).ListenAndServe())
 }
 
 func newMCPHandler(server *mcp.Server, token string) http.Handler {

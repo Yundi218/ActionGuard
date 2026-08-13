@@ -2,10 +2,10 @@ package main
 
 import (
 	"log"
-	"net/http"
 
 	"github.com/Yundi218/ActionGuard/internal/config"
 	"github.com/Yundi218/ActionGuard/internal/httpapi"
+	"github.com/Yundi218/ActionGuard/internal/httpserver"
 )
 
 func main() {
@@ -13,7 +13,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	server := &http.Server{Addr: cfg.APIAddr, Handler: httpapi.NewRouter(httpapi.Dependencies{})}
+	server := httpserver.New(cfg.APIAddr, httpapi.NewRouter(httpapi.Dependencies{}))
 	log.Printf("api listening on %s", cfg.APIAddr)
 	log.Fatal(server.ListenAndServe())
 }

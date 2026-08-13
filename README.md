@@ -14,7 +14,7 @@ ActionGuard 是一个面向零售售后场景的策略约束型业务执行项�
 - 选择错误工具，或使用错误参数和调用顺序。
 - 在策略不允许时执行退款、补偿等高风险动作。
 - 工具超时或响应丢失后重复提交，产生重复副作用。
-- 将物流备注、商品描述中的恶意文本当成系统指令。
+- 将物流备注中的恶意文本当成系统指令。
 - 缺少数据库级断言，只能依靠单次 Demo 判断效果。
 
 ActionGuard 的长期方向是让 LLM 负责语义判断，让确定性 Runtime 负责执行，让 Verifier 负责风险边界，并以业务数据库作为最终事实。Phase 1 先固定最底层的可执行合同：确定性 commerce service、PostgreSQL store 和 streamable HTTP MCP gateway。
@@ -46,7 +46,7 @@ MCP discovery exposes exactly eight tools:
 | `issue_refund` | `high_risk_write` | `refund:write` | Required |
 | `issue_coupon` | `high_risk_write` | `coupon:write` | Required |
 
-Read operations enforce order ownership where applicable. Writes validate trusted context and business preconditions before committing, and retries with the same operation and idempotency key return the original resource without duplicating the side effect.
+Read operations enforce order ownership where applicable. Writes validate trusted context and business preconditions before committing. A retry replays only when operation, idempotency key, trusted principal, and every request argument match exactly; reusing a key with a different principal or argument returns a stable conflict without exposing the original resource.
 
 ## Quick Start
 
@@ -98,9 +98,9 @@ The E2E test migrates PostgreSQL, reloads fixtures, starts a real `httptest` MCP
 ## Security And Data
 
 - All users, products, orders, shipments, inventory, replacements, coupons, and gateway values in this repository are synthetic.
-- Product descriptions and shipment notes are attacker-controlled free text. Tool responses keep such values under `untrusted_text`; they must never become trusted instructions or authorization inputs.
+- Shipment notes returned by the current tools are attacker-controlled free text. Tool responses keep them under `untrusted_text`; they must never become trusted instructions or authorization inputs. Product descriptions are stored as synthetic fixture data but are not returned by the Phase 1 tools.
 - User identity, Scope, run ID, step ID, and idempotency keys come from gateway headers, not Tool JSON supplied by an Agent.
-- The commerce service enforces ownership and authorization before writes. PostgreSQL constraints, transactions, and operation-scoped idempotency records protect persisted state and repeated requests.
+- The MCP gateway enforces per-tool Scopes. The commerce Service enforces ownership and business rules, with replay-aware prechecks. PostgreSQL enforces constraints, locked transactional rechecks, and principal/request-bound idempotency as the persisted authority.
 - The included gateway token and PostgreSQL password are local demo values only.
 
 ## Progress

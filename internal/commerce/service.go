@@ -40,63 +40,98 @@ func (s *Service) CheckEligibility(ctx context.Context, userID, orderID string) 
 	if err != nil {
 		return Eligibility{}, err
 	}
-	if order.Status != "delivered" || order.DeliveredAt == nil {
-		return Eligibility{ReasonCode: "not_delivered"}, nil
-	}
-
-	deadline := order.DeliveredAt.Add(returnWindow)
-	if s.now().After(deadline) {
-		return Eligibility{ReasonCode: "return_window_expired", Deadline: &deadline}, nil
-	}
-	return Eligibility{Eligible: true, ReasonCode: "within_return_window", Deadline: &deadline}, nil
+	return eligibilityForOrder(order, s.now()), nil
 }
 
 func (s *Service) CreateReturn(ctx context.Context, userID, orderID, reason, idempotencyKey string) (WriteResult, error) {
-	eligibility, err := s.CheckEligibility(ctx, userID, orderID)
+	identity, err := newReturnIdentity(userID, orderID, reason, idempotencyKey)
 	if err != nil {
 		return WriteResult{}, err
 	}
-	if !eligibility.Eligible {
-		return WriteResult{}, ErrIneligible
+	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
+		return result, err
 	}
-	return s.store.CreateReturn(ctx, orderID, reason, idempotencyKey)
+
+	evaluatedAt := s.now()
+	order, err := s.ownedOrder(ctx, userID, orderID)
+	if err != nil {
+		return s.replayOrError(ctx, identity, err)
+	}
+	if !eligibilityForOrder(order, evaluatedAt).Eligible {
+		return s.replayOrError(ctx, identity, ErrIneligible)
+	}
+	return s.store.CreateReturn(ctx, identity, orderID, reason, evaluatedAt)
 }
 
 func (s *Service) CreateReplacement(ctx context.Context, userID, orderID, sku, reason, idempotencyKey string) (WriteResult, error) {
-	eligibility, err := s.CheckEligibility(ctx, userID, orderID)
+	identity, err := newReplacementIdentity(userID, orderID, sku, reason, idempotencyKey)
 	if err != nil {
 		return WriteResult{}, err
 	}
-	if !eligibility.Eligible {
-		return WriteResult{}, ErrIneligible
+	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
+		return result, err
 	}
 
+	evaluatedAt := s.now()
+	order, err := s.ownedOrder(ctx, userID, orderID)
+	if err != nil {
+		return s.replayOrError(ctx, identity, err)
+	}
+	if !eligibilityForOrder(order, evaluatedAt).Eligible {
+		return s.replayOrError(ctx, identity, ErrIneligible)
+	}
 	inventory, err := s.CheckInventory(ctx, sku)
 	if err != nil {
-		return WriteResult{}, err
+		return s.replayOrError(ctx, identity, err)
 	}
 	if inventory.Available <= 0 {
-		return WriteResult{}, ErrInventoryEmpty
+		return s.replayOrError(ctx, identity, ErrInventoryEmpty)
 	}
-	return s.store.CreateReplacement(ctx, orderID, sku, reason, idempotencyKey)
+	return s.store.CreateReplacement(ctx, identity, orderID, sku, reason, evaluatedAt)
 }
 
 func (s *Service) IssueRefund(ctx context.Context, userID, orderID string, amountCents int64, idempotencyKey string) (WriteResult, error) {
-	order, err := s.ownedOrder(ctx, userID, orderID)
+	identity, err := newRefundIdentity(userID, orderID, amountCents, idempotencyKey)
 	if err != nil {
 		return WriteResult{}, err
 	}
-	if amountCents <= 0 || amountCents > order.PaidAmountCents-order.RefundedAmountCents {
-		return WriteResult{}, ErrInvalidAmount
+	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
+		return result, err
 	}
-	return s.store.IssueRefund(ctx, orderID, amountCents, idempotencyKey)
+
+	order, err := s.ownedOrder(ctx, userID, orderID)
+	if err != nil {
+		return s.replayOrError(ctx, identity, err)
+	}
+	if amountCents <= 0 || amountCents > order.PaidAmountCents-order.RefundedAmountCents {
+		return s.replayOrError(ctx, identity, ErrInvalidAmount)
+	}
+	return s.store.IssueRefund(ctx, identity, orderID, amountCents)
 }
 
 func (s *Service) IssueCoupon(ctx context.Context, userID string, amountCents int64, reason, idempotencyKey string) (WriteResult, error) {
-	if amountCents < 1 || amountCents > 2000 {
-		return WriteResult{}, ErrInvalidAmount
+	identity, err := newCouponIdentity(userID, amountCents, reason, idempotencyKey)
+	if err != nil {
+		return WriteResult{}, err
 	}
-	return s.store.IssueCoupon(ctx, userID, amountCents, reason, idempotencyKey)
+	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
+		return result, err
+	}
+	if amountCents < 1 || amountCents > 2000 {
+		return s.replayOrError(ctx, identity, ErrInvalidAmount)
+	}
+	return s.store.IssueCoupon(ctx, identity, amountCents, reason)
+}
+
+func (s *Service) replayOrError(ctx context.Context, identity IdempotencyIdentity, original error) (WriteResult, error) {
+	result, replayed, err := s.store.ReplayWrite(ctx, identity)
+	if err != nil {
+		return WriteResult{}, err
+	}
+	if replayed {
+		return result, nil
+	}
+	return WriteResult{}, original
 }
 
 func (s *Service) ownedOrder(ctx context.Context, userID, orderID string) (Order, error) {
@@ -108,4 +143,15 @@ func (s *Service) ownedOrder(ctx context.Context, userID, orderID string) (Order
 		return Order{}, ErrForbidden
 	}
 	return order, nil
+}
+
+func eligibilityForOrder(order Order, now time.Time) Eligibility {
+	if order.Status != "delivered" || order.DeliveredAt == nil {
+		return Eligibility{ReasonCode: "not_delivered"}
+	}
+	deadline := order.DeliveredAt.Add(returnWindow)
+	if now.After(deadline) {
+		return Eligibility{ReasonCode: "return_window_expired", Deadline: &deadline}
+	}
+	return Eligibility{Eligible: true, ReasonCode: "within_return_window", Deadline: &deadline}
 }

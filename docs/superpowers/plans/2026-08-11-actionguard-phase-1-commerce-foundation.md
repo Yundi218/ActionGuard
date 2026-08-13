@@ -13,7 +13,7 @@
 - Module path is `github.com/Yundi218/ActionGuard`.
 - PostgreSQL is the only business source of truth; Redis is not introduced in this phase.
 - All users, orders, addresses, payments, shipments, and policies are synthetic.
-- Every write operation requires a non-empty idempotency key.
+- Every write operation requires a non-empty idempotency key and binds that operation/key to the trusted principal plus a canonical SHA-256 fingerprint of every typed request argument.
 - Tool outputs separate trusted structured fields from untrusted free text.
 - No real commerce, payment, logistics, or identity system is called.
 - `go test ./...` and `go vet ./...` must pass before every task commit.
@@ -32,9 +32,12 @@ internal/database/pool.go               # pgx pool construction
 internal/database/migrate.go            # embedded SQL migration runner
 internal/commerce/model.go              # domain entities and enums
 internal/commerce/errors.go             # stable domain error codes
+internal/commerce/idempotency.go        # typed principal/request idempotency identities
 internal/commerce/store.go              # persistence interface
 internal/commerce/postgres_store.go     # PostgreSQL implementation
 internal/commerce/service.go            # read and write business invariants
+internal/httpserver/server.go            # shared explicit HTTP timeout configuration
+internal/testdatabase/lock.go            # cross-process PostgreSQL integration-test lock
 internal/toolkit/contract.go             # risk, scope, call metadata, result envelope
 internal/mcpserver/server.go             # official SDK tool registration
 internal/mcpserver/handlers.go           # eight typed MCP handlers
@@ -455,6 +458,8 @@ create table if not exists coupons (
 create table if not exists idempotency_records (
   operation text not null,
   idempotency_key text not null,
+  principal_id text not null,
+  request_fingerprint text not null,
   result_type text not null,
   result_id text not null,
   created_at timestamptz not null default now(),
@@ -577,12 +582,15 @@ package commerce
 import "errors"
 
 var (
-	ErrNotFound        = errors.New("not found")
-	ErrForbidden       = errors.New("forbidden")
-	ErrIneligible      = errors.New("ineligible")
-	ErrInventoryEmpty  = errors.New("inventory empty")
-	ErrInvalidAmount   = errors.New("invalid amount")
-	ErrIdempotencyKey  = errors.New("idempotency key required")
+	ErrNotFound            = errors.New("not found")
+	ErrForbidden           = errors.New("forbidden")
+	ErrIneligible          = errors.New("ineligible")
+	ErrInventoryEmpty      = errors.New("inventory empty")
+	ErrInvalidAmount       = errors.New("invalid amount")
+	ErrIdempotencyKey      = errors.New("idempotency key required")
+	ErrIdempotencyConflict = errors.New("idempotency conflict")
+	ErrInvalidToolContext  = errors.New("invalid trusted tool context")
+	ErrInternalTool        = errors.New("internal tool error")
 )
 ```
 
@@ -591,16 +599,20 @@ Create `internal/commerce/store.go`:
 ```go
 package commerce
 
-import "context"
+import (
+	"context"
+	"time"
+)
 
 type Store interface {
 	GetOrder(context.Context, string) (Order, error)
 	GetShipmentByOrder(context.Context, string) (Shipment, error)
 	GetInventory(context.Context, string) (Inventory, error)
-	CreateReturn(context.Context, string, string, string) (WriteResult, error)
-	CreateReplacement(context.Context, string, string, string, string) (WriteResult, error)
-	IssueRefund(context.Context, string, int64, string) (WriteResult, error)
-	IssueCoupon(context.Context, string, int64, string, string) (WriteResult, error)
+	ReplayWrite(context.Context, IdempotencyIdentity) (WriteResult, bool, error)
+	CreateReturn(context.Context, IdempotencyIdentity, string, string, time.Time) (WriteResult, error)
+	CreateReplacement(context.Context, IdempotencyIdentity, string, string, string, time.Time) (WriteResult, error)
+	IssueRefund(context.Context, IdempotencyIdentity, string, int64) (WriteResult, error)
+	IssueCoupon(context.Context, IdempotencyIdentity, int64, string) (WriteResult, error)
 }
 ```
 
@@ -619,11 +631,14 @@ func TestPostgresStoreGetOrder(t *testing.T) {
 
 func TestPostgresStoreCreateReturnIsIdempotent(t *testing.T) {
 	store := newTestStore(t)
-	first, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "return-key-1")
+	service := NewServiceWithClock(store, func() time.Time {
+		return time.Date(2026, 8, 2, 12, 0, 0, 0, time.UTC)
+	})
+	first, err := service.CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key-1")
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := store.CreateReturn(context.Background(), "AG-1042", "damaged", "return-key-1")
+	second, err := service.CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key-1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -642,26 +657,27 @@ Expected: FAIL with `undefined: newTestStore` or missing `PostgresStore` methods
 Create `internal/commerce/postgres_store.go`. Implement read methods with `QueryRow`. Implement each write method in one transaction using this algorithm:
 
 ```go
-func replayedResult(ctx context.Context, tx pgx.Tx, operation, key string) (WriteResult, bool, error) {
-	var result WriteResult
+func replayedResult(ctx context.Context, tx pgx.Tx, identity IdempotencyIdentity) (WriteResult, bool, error) {
+	var principalID, fingerprint, resultType, resultID string
 	err := tx.QueryRow(ctx, `
-		select result_type, result_id
+		select principal_id, request_fingerprint, result_type, result_id
 		from idempotency_records
 		where operation = $1 and idempotency_key = $2
-	`, operation, key).Scan(&result.ResourceType, &result.ResourceID)
+	`, identity.Operation, identity.Key).Scan(&principalID, &fingerprint, &resultType, &resultID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return WriteResult{}, false, nil
 	}
 	if err != nil {
 		return WriteResult{}, false, err
 	}
-	result.Status = "created"
-	result.Replayed = true
-	return result, true, nil
+	if principalID != identity.PrincipalID || fingerprint != identity.RequestFingerprint {
+		return WriteResult{}, false, ErrIdempotencyConflict
+	}
+	return WriteResult{ResourceType: resultType, ResourceID: resultID, Status: "created", Replayed: true}, true, nil
 }
 ```
 
-At the start of every write transaction, acquire `pg_advisory_xact_lock(hashtextextended(operation || ':' || idempotency_key, 0))` before checking `idempotency_records`. This serializes concurrent submissions of the same operation and key. For a new write, lock the order or inventory row with `FOR UPDATE`, insert the resource, update affected balances or inventory, insert `idempotency_records`, and commit. Return `ErrIdempotencyKey` before opening a transaction when the key is empty.
+At the start of every write transaction, acquire a transaction-level advisory lock derived from separately typed `operation` and `idempotency_key` parameters before checking `idempotency_records`. Compare both `principal_id` and `request_fingerprint` before returning a replay. A mismatch returns `ErrIdempotencyConflict` with an empty result. For a new write, lock the owned order and then any inventory or refund-balance state with `FOR UPDATE`, recheck eligibility/balance/inventory, insert the resource, update affected state, insert the principal/fingerprint-bound idempotency record, and commit. Return `ErrIdempotencyKey` before opening a transaction when the key is empty. Deferred rollback joins a rollback failure to a primary error and ignores `pgx.ErrTxClosed` after commit.
 
 Define the concrete store and constructor exactly as:
 
@@ -798,7 +814,7 @@ func (s *Service) IssueRefund(context.Context, string, string, int64, string) (W
 func (s *Service) IssueCoupon(context.Context, string, int64, string, string) (WriteResult, error)
 ```
 
-`CheckEligibility` returns eligible only when the order is delivered, `DeliveredAt` is present, and `now <= DeliveredAt + 30 days`. `CreateReturn` and `CreateReplacement` call `CheckEligibility`. `CreateReplacement` also requires positive inventory. `IssueRefund` requires `0 < amount <= paid - refunded`. `IssueCoupon` accepts amounts from 1 to 2000 cents in Phase 1.
+`CheckEligibility` returns eligible only when the order is delivered, `DeliveredAt` is present, and `now <= DeliveredAt + 30 days`. Before mutable prechecks, every write performs `ReplayWrite` with its exact typed identity; a precheck failure performs one final exact replay query before returning. `CreateReturn` and `CreateReplacement` enforce eligibility. `CreateReplacement` also requires positive inventory. `IssueRefund` requires `0 < amount <= paid - refunded`. `IssueCoupon` accepts amounts from 1 to 2000 cents in Phase 1. PostgreSQL repeats mutable checks under row locks after the transactional replay check.
 
 - [ ] **Step 3: Write failing tool envelope tests**
 
@@ -1051,7 +1067,7 @@ type IssueCouponParams struct {
 }
 ```
 
-Identity, Scope, run metadata, and idempotency keys are not Tool arguments. `TrustedContextMiddleware` first validates `Authorization: Bearer <MCP_GATEWAY_TOKEN>`, then reads `X-ActionGuard-User`, `X-ActionGuard-Run`, `X-ActionGuard-Step`, `X-ActionGuard-Scopes`, and `Idempotency-Key` headers supplied by the trusted Gateway and stores a `toolkit.CallContext` in the request context. Each handler loads that context with `toolkit.FromContext`, calls `Validate(risk)`, requires its exact Scope, invokes `commerce.Service`, and JSON-encodes `toolkit.Envelope[T]` into a `mcp.TextContent`. Shipment notes and product descriptions go only into `UntrustedText`.
+Identity, Scope, run metadata, and idempotency keys are not Tool arguments. `TrustedContextMiddleware` first validates `Authorization: Bearer <MCP_GATEWAY_TOKEN>`, then reads `X-ActionGuard-User`, `X-ActionGuard-Run`, `X-ActionGuard-Step`, `X-ActionGuard-Scopes`, and `Idempotency-Key` headers supplied by the trusted Gateway and stores a `toolkit.CallContext` in the request context. Each handler loads that context with `toolkit.FromContext`, calls `Validate(risk)`, requires its exact Scope, invokes `commerce.Service`, and JSON-encodes `toolkit.Envelope[T]` into a `mcp.TextContent`. Returned shipment notes go only into `UntrustedText`; product descriptions are not exposed by the Phase 1 tools. The registration boundary passes through only the explicit stable domain-error allowlist, logs unexpected errors with tool context, and returns `ErrInternalTool` without database, Schema, DSN, or network details.
 
 Use these exact scopes: `order:read`, `shipment:read`, `inventory:read`,
 `eligibility:read`, `return:write`, `replacement:write`, `refund:write`, and
@@ -1210,7 +1226,7 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", handler)
 	log.Printf("commerce MCP listening on %s/mcp", cfg.MCPAddr)
-	log.Fatal(http.ListenAndServe(cfg.MCPAddr, mux))
+	log.Fatal(httpserver.New(cfg.MCPAddr, mux).ListenAndServe())
 }
 ```
 
@@ -1322,7 +1338,7 @@ demo-up:
 
 Create `internal/mcpserver/e2e_test.go`. The test must:
 
-1. Open `TEST_DATABASE_URL`, migrate, load `fixtures/commerce.sql` using `os.ReadFile("../../fixtures/commerce.sql")`, and execute it before the test flow.
+1. Open `TEST_DATABASE_URL`, acquire the shared session-level public-schema advisory lock with a bounded context, migrate, load `fixtures/commerce.sql` using `os.ReadFile("../../fixtures/commerce.sql")`, and execute it before the test flow.
 2. Start `mcpserver.New` with a real `PostgresStore` behind an `httptest.Server`, stateless streamable MCP handler, and `TrustedContextMiddleware`.
 3. Call `get_order`, `check_eligibility`, `check_inventory`, `create_replacement`, and `issue_coupon` in order.
 4. Repeat `create_replacement` with the same idempotency key.
@@ -1486,7 +1502,8 @@ Phase 1 is complete only when all of the following evidence exists in the reposi
 - GitHub Actions `ci` is green on `main`.
 - MCP discovery returns exactly the eight designed tools.
 - The named damaged-item flow passes against PostgreSQL.
-- Repeating a write with the same idempotency key produces one database side effect.
+- Repeating a write with the same operation, idempotency key, principal, and exact arguments produces one database side effect and replays the original result even after mutable preconditions change.
+- Reusing an operation/key with a different principal or argument returns `ErrIdempotencyConflict`, leaks no original resource ID, and creates no additional side effect.
 - Cross-user access and missing write Scope are rejected.
 - Malicious shipment or product text remains inside `untrusted_text`.
 - README labels later Agent, RAG, Temporal, evaluation, and UI work as roadmap rather than completed functionality.
