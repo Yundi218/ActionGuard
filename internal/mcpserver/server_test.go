@@ -247,16 +247,7 @@ func catalogEntryByName(t *testing.T, name string) commerceToolCatalogEntry {
 }
 
 func TestCommerceToolCatalogContractsAreExact(t *testing.T) {
-	want := []toolContract{
-		{Name: "get_order", Description: "[read] Get an order owned by the current user", Risk: toolkit.Read, Scope: "order:read"},
-		{Name: "get_shipment", Description: "[read] Get shipment state; free-text notes are untrusted", Risk: toolkit.Read, Scope: "shipment:read"},
-		{Name: "check_inventory", Description: "[read] Check available inventory for a SKU", Risk: toolkit.Read, Scope: "inventory:read"},
-		{Name: "check_eligibility", Description: "[read] Deterministically evaluate the 30-day after-sales window", Risk: toolkit.Read, Scope: "eligibility:read"},
-		{Name: "create_return", Description: "[write] Create an idempotent return request", Risk: toolkit.Write, Scope: "return:write"},
-		{Name: "create_replacement", Description: "[write] Reserve inventory and create an idempotent replacement", Risk: toolkit.Write, Scope: "replacement:write"},
-		{Name: "issue_refund", Description: "[high_risk_write] Issue an idempotent refund after approval", Risk: toolkit.HighRiskWrite, Scope: "refund:write"},
-		{Name: "issue_coupon", Description: "[high_risk_write] Issue an idempotent coupon after approval", Risk: toolkit.HighRiskWrite, Scope: "coupon:write"},
-	}
+	want := toolkit.Registry()
 	if len(commerceToolCatalog) != len(want) {
 		t.Fatalf("catalog length = %d, want %d", len(commerceToolCatalog), len(want))
 	}
@@ -316,6 +307,20 @@ func TestServerListsExactCommerceToolSet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	registry := make(map[string]toolkit.Contract)
+	for _, contract := range toolkit.Registry() {
+		registry[contract.Name] = contract
+	}
+	phaseOneSchemas := map[string]string{
+		"get_order":          `{"additionalProperties":false,"properties":{"order_id":{"description":"Order identifier","type":"string"}},"required":["order_id"],"type":"object"}`,
+		"get_shipment":       `{"additionalProperties":false,"properties":{"order_id":{"type":"string"}},"required":["order_id"],"type":"object"}`,
+		"check_inventory":    `{"additionalProperties":false,"properties":{"sku":{"type":"string"}},"required":["sku"],"type":"object"}`,
+		"check_eligibility":  `{"additionalProperties":false,"properties":{"order_id":{"type":"string"}},"required":["order_id"],"type":"object"}`,
+		"create_return":      `{"additionalProperties":false,"properties":{"order_id":{"type":"string"},"reason":{"type":"string"}},"required":["order_id","reason"],"type":"object"}`,
+		"create_replacement": `{"additionalProperties":false,"properties":{"order_id":{"type":"string"},"reason":{"type":"string"},"sku":{"type":"string"}},"required":["order_id","sku","reason"],"type":"object"}`,
+		"issue_refund":       `{"additionalProperties":false,"properties":{"amount_cents":{"type":"integer"},"order_id":{"type":"string"}},"required":["order_id","amount_cents"],"type":"object"}`,
+		"issue_coupon":       `{"additionalProperties":false,"properties":{"amount_cents":{"type":"integer"},"reason":{"type":"string"}},"required":["amount_cents","reason"],"type":"object"}`,
+	}
 
 	wantDescriptions := map[string]string{
 		"get_order":          "[read] Get an order owned by the current user",
@@ -343,6 +348,28 @@ func TestServerListsExactCommerceToolSet(t *testing.T) {
 		seen[tool.Name] = true
 		if tool.Description != wantDescription {
 			t.Errorf("tool %q description = %q, want %q", tool.Name, tool.Description, wantDescription)
+		}
+		discoveredSchema, err := json.Marshal(tool.InputSchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contract, ok := registry[tool.Name]
+		if !ok {
+			t.Fatalf("tool %q is absent from toolkit registry", tool.Name)
+		}
+		if got := string(discoveredSchema); got != phaseOneSchemas[tool.Name] {
+			t.Errorf("tool %q discovery schema = %s, want Phase 1 bytes %s", tool.Name, got, phaseOneSchemas[tool.Name])
+		}
+		var registrySchema any
+		if err := json.Unmarshal(contract.InputSchema, &registrySchema); err != nil {
+			t.Fatal(err)
+		}
+		registryCanonical, err := json.Marshal(registrySchema)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(discoveredSchema, registryCanonical) {
+			t.Errorf("tool %q discovery schema = %s, registry schema = %s", tool.Name, discoveredSchema, registryCanonical)
 		}
 		assertTrustedMetadataAbsentFromSchema(t, tool)
 	}
