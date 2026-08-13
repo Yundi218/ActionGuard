@@ -13,57 +13,62 @@ type toolContract struct {
 	Scope       string
 }
 
-var (
-	getOrderTool = toolContract{
-		Name: "get_order", Description: "[read] Get an order owned by the current user", Risk: toolkit.Read, Scope: "order:read",
-	}
-	getShipmentTool = toolContract{
-		Name: "get_shipment", Description: "[read] Get shipment state; free-text notes are untrusted", Risk: toolkit.Read, Scope: "shipment:read",
-	}
-	checkInventoryTool = toolContract{
-		Name: "check_inventory", Description: "[read] Check available inventory for a SKU", Risk: toolkit.Read, Scope: "inventory:read",
-	}
-	checkEligibilityTool = toolContract{
-		Name: "check_eligibility", Description: "[read] Deterministically evaluate the 30-day after-sales window", Risk: toolkit.Read, Scope: "eligibility:read",
-	}
-	createReturnTool = toolContract{
-		Name: "create_return", Description: "[write] Create an idempotent return request", Risk: toolkit.Write, Scope: "return:write",
-	}
-	createReplacementTool = toolContract{
-		Name: "create_replacement", Description: "[write] Reserve inventory and create an idempotent replacement", Risk: toolkit.Write, Scope: "replacement:write",
-	}
-	issueRefundTool = toolContract{
-		Name: "issue_refund", Description: "[high_risk_write] Issue an idempotent refund after approval", Risk: toolkit.HighRiskWrite, Scope: "refund:write",
-	}
-	issueCouponTool = toolContract{
-		Name: "issue_coupon", Description: "[high_risk_write] Issue an idempotent coupon after approval", Risk: toolkit.HighRiskWrite, Scope: "coupon:write",
-	}
+type toolRegistration func(*mcp.Server, *commerce.Service, toolContract)
 
-	toolContracts = []toolContract{
-		getOrderTool,
-		getShipmentTool,
-		checkInventoryTool,
-		checkEligibilityTool,
-		createReturnTool,
-		createReplacementTool,
-		issueRefundTool,
-		issueCouponTool,
-	}
-)
+type commerceToolCatalogEntry struct {
+	toolContract
+	register toolRegistration
+}
+
+var commerceToolCatalog = []commerceToolCatalogEntry{
+	{
+		toolContract: toolContract{Name: "get_order", Description: "[read] Get an order owned by the current user", Risk: toolkit.Read, Scope: "order:read"},
+		register:     typedToolRegistration(getOrderHandler),
+	},
+	{
+		toolContract: toolContract{Name: "get_shipment", Description: "[read] Get shipment state; free-text notes are untrusted", Risk: toolkit.Read, Scope: "shipment:read"},
+		register:     typedToolRegistration(getShipmentHandler),
+	},
+	{
+		toolContract: toolContract{Name: "check_inventory", Description: "[read] Check available inventory for a SKU", Risk: toolkit.Read, Scope: "inventory:read"},
+		register:     typedToolRegistration(checkInventoryHandler),
+	},
+	{
+		toolContract: toolContract{Name: "check_eligibility", Description: "[read] Deterministically evaluate the 30-day after-sales window", Risk: toolkit.Read, Scope: "eligibility:read"},
+		register:     typedToolRegistration(checkEligibilityHandler),
+	},
+	{
+		toolContract: toolContract{Name: "create_return", Description: "[write] Create an idempotent return request", Risk: toolkit.Write, Scope: "return:write"},
+		register:     typedToolRegistration(createReturnHandler),
+	},
+	{
+		toolContract: toolContract{Name: "create_replacement", Description: "[write] Reserve inventory and create an idempotent replacement", Risk: toolkit.Write, Scope: "replacement:write"},
+		register:     typedToolRegistration(createReplacementHandler),
+	},
+	{
+		toolContract: toolContract{Name: "issue_refund", Description: "[high_risk_write] Issue an idempotent refund after approval", Risk: toolkit.HighRiskWrite, Scope: "refund:write"},
+		register:     typedToolRegistration(issueRefundHandler),
+	},
+	{
+		toolContract: toolContract{Name: "issue_coupon", Description: "[high_risk_write] Issue an idempotent coupon after approval", Risk: toolkit.HighRiskWrite, Scope: "coupon:write"},
+		register:     typedToolRegistration(issueCouponHandler),
+	},
+}
 
 func New(svc *commerce.Service) *mcp.Server {
 	server := mcp.NewServer(&mcp.Implementation{Name: "actionguard-commerce", Version: "v0.1.0"}, nil)
-	registerTool(server, getOrderTool, getOrderHandler(svc))
-	registerTool(server, getShipmentTool, getShipmentHandler(svc))
-	registerTool(server, checkInventoryTool, checkInventoryHandler(svc))
-	registerTool(server, checkEligibilityTool, checkEligibilityHandler(svc))
-	registerTool(server, createReturnTool, createReturnHandler(svc))
-	registerTool(server, createReplacementTool, createReplacementHandler(svc))
-	registerTool(server, issueRefundTool, issueRefundHandler(svc))
-	registerTool(server, issueCouponTool, issueCouponHandler(svc))
+	for _, tool := range commerceToolCatalog {
+		tool.register(server, svc, tool.toolContract)
+	}
 	return server
 }
 
-func registerTool[Params any](server *mcp.Server, contract toolContract, handler mcp.ToolHandlerFor[Params, any]) {
-	mcp.AddTool(server, &mcp.Tool{Name: contract.Name, Description: contract.Description}, handler)
+func typedToolRegistration[Params any](handlerFactory func(*commerce.Service, toolContract) mcp.ToolHandlerFor[Params, any]) toolRegistration {
+	return func(server *mcp.Server, svc *commerce.Service, contract toolContract) {
+		mcp.AddTool(
+			server,
+			&mcp.Tool{Name: contract.Name, Description: contract.Description},
+			handlerFactory(svc, contract),
+		)
+	}
 }

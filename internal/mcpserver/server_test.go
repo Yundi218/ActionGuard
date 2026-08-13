@@ -157,43 +157,71 @@ type toolHandlerCase struct {
 }
 
 func commerceHandlerCases() []toolHandlerCase {
-	return []toolHandlerCase{
-		{contract: getOrderTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := getOrderHandler(svc)(ctx, nil, GetOrderParams{OrderID: testOrderID})
-			return result, err
-		}},
-		{contract: getShipmentTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := getShipmentHandler(svc)(ctx, nil, GetShipmentParams{OrderID: testOrderID})
-			return result, err
-		}},
-		{contract: checkInventoryTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := checkInventoryHandler(svc)(ctx, nil, CheckInventoryParams{SKU: testSKU})
-			return result, err
-		}},
-		{contract: checkEligibilityTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := checkEligibilityHandler(svc)(ctx, nil, CheckEligibilityParams{OrderID: testOrderID})
-			return result, err
-		}},
-		{contract: createReturnTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := createReturnHandler(svc)(ctx, nil, CreateReturnParams{OrderID: testOrderID, Reason: "damaged"})
-			return result, err
-		}},
-		{contract: createReplacementTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := createReplacementHandler(svc)(ctx, nil, CreateReplacementParams{OrderID: testOrderID, SKU: testSKU, Reason: "damaged"})
-			return result, err
-		}},
-		{contract: issueRefundTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := issueRefundHandler(svc)(ctx, nil, IssueRefundParams{OrderID: testOrderID, AmountCents: 2500})
-			return result, err
-		}},
-		{contract: issueCouponTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
-			result, _, err := issueCouponHandler(svc)(ctx, nil, IssueCouponParams{AmountCents: 1500, Reason: "service recovery"})
-			return result, err
-		}},
+	cases := make([]toolHandlerCase, 0, len(commerceToolCatalog))
+	for _, tool := range commerceToolCatalog {
+		entry := tool
+		var invoke handlerInvocation
+		switch entry.Name {
+		case "get_order":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := getOrderHandler(svc, entry.toolContract)(ctx, nil, GetOrderParams{OrderID: testOrderID})
+				return result, err
+			}
+		case "get_shipment":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := getShipmentHandler(svc, entry.toolContract)(ctx, nil, GetShipmentParams{OrderID: testOrderID})
+				return result, err
+			}
+		case "check_inventory":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := checkInventoryHandler(svc, entry.toolContract)(ctx, nil, CheckInventoryParams{SKU: testSKU})
+				return result, err
+			}
+		case "check_eligibility":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := checkEligibilityHandler(svc, entry.toolContract)(ctx, nil, CheckEligibilityParams{OrderID: testOrderID})
+				return result, err
+			}
+		case "create_return":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := createReturnHandler(svc, entry.toolContract)(ctx, nil, CreateReturnParams{OrderID: testOrderID, Reason: "damaged"})
+				return result, err
+			}
+		case "create_replacement":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := createReplacementHandler(svc, entry.toolContract)(ctx, nil, CreateReplacementParams{OrderID: testOrderID, SKU: testSKU, Reason: "damaged"})
+				return result, err
+			}
+		case "issue_refund":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := issueRefundHandler(svc, entry.toolContract)(ctx, nil, IssueRefundParams{OrderID: testOrderID, AmountCents: 2500})
+				return result, err
+			}
+		case "issue_coupon":
+			invoke = func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+				result, _, err := issueCouponHandler(svc, entry.toolContract)(ctx, nil, IssueCouponParams{AmountCents: 1500, Reason: "service recovery"})
+				return result, err
+			}
+		default:
+			panic("missing test invocation for catalog tool " + entry.Name)
+		}
+		cases = append(cases, toolHandlerCase{contract: entry.toolContract, invoke: invoke})
 	}
+	return cases
 }
 
-func TestToolContractsAreExact(t *testing.T) {
+func catalogEntryByName(t *testing.T, name string) commerceToolCatalogEntry {
+	t.Helper()
+	for _, entry := range commerceToolCatalog {
+		if entry.Name == name {
+			return entry
+		}
+	}
+	t.Fatalf("catalog entry %q not found", name)
+	return commerceToolCatalogEntry{}
+}
+
+func TestCommerceToolCatalogContractsAreExact(t *testing.T) {
 	want := []toolContract{
 		{Name: "get_order", Description: "[read] Get an order owned by the current user", Risk: toolkit.Read, Scope: "order:read"},
 		{Name: "get_shipment", Description: "[read] Get shipment state; free-text notes are untrusted", Risk: toolkit.Read, Scope: "shipment:read"},
@@ -204,8 +232,16 @@ func TestToolContractsAreExact(t *testing.T) {
 		{Name: "issue_refund", Description: "[high_risk_write] Issue an idempotent refund after approval", Risk: toolkit.HighRiskWrite, Scope: "refund:write"},
 		{Name: "issue_coupon", Description: "[high_risk_write] Issue an idempotent coupon after approval", Risk: toolkit.HighRiskWrite, Scope: "coupon:write"},
 	}
-	if !reflect.DeepEqual(toolContracts, want) {
-		t.Fatalf("tool contracts = %#v, want %#v", toolContracts, want)
+	if len(commerceToolCatalog) != len(want) {
+		t.Fatalf("catalog length = %d, want %d", len(commerceToolCatalog), len(want))
+	}
+	for i, entry := range commerceToolCatalog {
+		if !reflect.DeepEqual(entry.toolContract, want[i]) {
+			t.Errorf("catalog contract %d = %#v, want %#v", i, entry.toolContract, want[i])
+		}
+		if entry.register == nil {
+			t.Errorf("catalog entry %q has no registration adapter", entry.Name)
+		}
 	}
 }
 
@@ -398,7 +434,8 @@ func TestHandlerRejectsMissingTrustedContextFields(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			store := newRecordingStore()
-			result, _, err := getOrderHandler(newTestService(store))(tt.ctx, nil, GetOrderParams{OrderID: testOrderID})
+			entry := catalogEntryByName(t, "get_order")
+			result, _, err := getOrderHandler(newTestService(store), entry.toolContract)(tt.ctx, nil, GetOrderParams{OrderID: testOrderID})
 			if err == nil || result != nil {
 				t.Fatalf("result = %#v, error = %v, want trusted-context error", result, err)
 			}
@@ -486,7 +523,8 @@ func TestHandlersForwardEveryToolArgument(t *testing.T) {
 
 func TestCreateReturnReplayIsExposedInEnvelope(t *testing.T) {
 	store := newRecordingStore()
-	handler := createReturnHandler(newTestService(store))
+	entry := catalogEntryByName(t, "create_return")
+	handler := createReturnHandler(newTestService(store), entry.toolContract)
 	ctx := trustedContext("return:write", testIdemKey)
 	params := CreateReturnParams{OrderID: testOrderID, Reason: "damaged"}
 
@@ -510,7 +548,8 @@ func TestCreateReturnReplayIsExposedInEnvelope(t *testing.T) {
 
 func TestShipmentNoteAppearsOnlyAsUntrustedText(t *testing.T) {
 	store := newRecordingStore()
-	result, _, err := getShipmentHandler(newTestService(store))(
+	entry := catalogEntryByName(t, "get_shipment")
+	result, _, err := getShipmentHandler(newTestService(store), entry.toolContract)(
 		trustedContext("shipment:read", ""), nil, GetShipmentParams{OrderID: testOrderID},
 	)
 	if err != nil {

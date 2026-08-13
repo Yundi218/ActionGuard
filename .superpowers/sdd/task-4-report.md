@@ -217,3 +217,86 @@ git diff --check
 
 Result: all commands exited successfully. The full test suite passed for all
 packages with tests; `cmd/api` and `migrations` reported no test files.
+
+## Second Review Follow-up: Authoritative Catalog and Bounded Reads (2026-08-13)
+
+### Catalog RED
+
+The review test was changed first to iterate `commerceToolCatalog`, compare the
+exact embedded contract on every entry, require a registration adapter, and
+pass each iterated entry's contract into its typed handler factory.
+
+```text
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test ./internal/mcpserver -run 'TestCommerceToolCatalogContractsAreExact|TestEveryHandlerRequiresItsExactScope|TestReadHandlersDoNotRequireIdempotencyAndWritesDo' -count=1
+```
+
+Observed before the catalog refactor:
+
+```text
+internal/mcpserver/server_test.go:160:42: undefined: commerceToolCatalog
+internal/mcpserver/server_test.go:167:44: too many arguments in call to getOrderHandler
+internal/mcpserver/server_test.go:202:47: too many errors
+FAIL github.com/Yundi218/ActionGuard/internal/mcpserver [build failed]
+```
+
+After implementation, the focused catalog, discovery, scope, risk,
+argument-forwarding, replay, and trust-separation tests all passed. `New`
+iterates the single catalog; each entry's generic registration adapter keeps
+the MCP SDK handler parameter type and passes that entry's contract into the
+handler factory and then `validateCall`.
+
+The exact test was also mutation-checked by changing only the production
+`issue_refund` catalog risk from `HighRiskWrite` to `Write` while retaining
+`refund:write`:
+
+```text
+catalog contract 6 = mcpserver.toolContract{Name:"issue_refund", Description:"[high_risk_write] Issue an idempotent refund after approval", Risk:"write", Scope:"refund:write"}, want mcpserver.toolContract{Name:"issue_refund", Description:"[high_risk_write] Issue an idempotent refund after approval", Risk:"high_risk_write", Scope:"refund:write"}
+--- FAIL: TestCommerceToolCatalogContractsAreExact
+```
+
+Restoring `HighRiskWrite` made the exact test pass. Handler tests construct
+their invocations from those same catalog entries, so the contract supplied to
+handler validation changes with the production entry; there is no separate
+per-handler contract global.
+
+### Request Body RED
+
+The production-handler tests cover both known `Content-Length` and
+unknown/chunked oversized requests returning HTTP 413. The exact-limit test
+also checks body replacement and original-body closure, while the 401 test
+retains its zero-byte-read assertion. A small-body read-size test exposed the
+eager allocation:
+
+```text
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test ./cmd/commerce-mcp -run 'TestMCPHandlerReturns413ForKnownContentLength|TestMCPHandlerReturns413ForUnknownChunkedLength|TestMCPMuxPassesExactlyOneMiBBodyToDownstream|TestLimitRequestBodyDoesNotPreallocateMaximumBuffer|TestMCPHandlerRejectsUnauthenticatedOversizedRequestWithoutReadingBody' -count=1 -v
+```
+
+Observed before replacing the fixed allocation:
+
+```text
+=== RUN   TestLimitRequestBodyDoesNotPreallocateMaximumBuffer
+    main_test.go:126: largest read buffer = 1048577, want dynamic buffer smaller than 1048576
+--- FAIL: TestLimitRequestBodyDoesNotPreallocateMaximumBuffer (0.00s)
+```
+
+### GREEN
+
+`limitRequestBody` now uses `io.LimitReader` capped at `max+1` and
+`io.ReadAll`'s dynamic buffer, rejects `len(body) > max`, restores accepted
+bodies, and closes the original body. Authentication remains outside the body
+limiter, and `http.MaxBytesHandler` remains around the MCP transport as defense
+in depth. The same focused command passed all five tests.
+
+### Final Verification
+
+```text
+gofmt -w cmd/commerce-mcp/main.go cmd/commerce-mcp/main_test.go internal/mcpserver/server.go internal/mcpserver/handlers.go internal/mcpserver/server_test.go
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test -count=1 ./cmd/commerce-mcp ./internal/mcpserver
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test -count=1 ./...
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go vet ./...
+git diff --check
+```
+
+All commands exited 0. The focused packages passed; the full suite passed for
+all packages with tests; `cmd/api` and `migrations` reported no test files;
+`go vet` and `git diff --check` produced no findings.

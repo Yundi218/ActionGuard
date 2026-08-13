@@ -74,9 +74,9 @@ func TrustedContextMiddleware(token string, next http.Handler) http.Handler {
 	})
 }
 
-func getOrderHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetOrderParams, any] {
+func getOrderHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[GetOrderParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params GetOrderParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, getOrderTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -88,9 +88,9 @@ func getOrderHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetOrderParams, a
 	}
 }
 
-func getShipmentHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetShipmentParams, any] {
+func getShipmentHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[GetShipmentParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params GetShipmentParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, getShipmentTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -108,9 +108,9 @@ func getShipmentHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetShipmentPar
 	}
 }
 
-func checkInventoryHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckInventoryParams, any] {
+func checkInventoryHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[CheckInventoryParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CheckInventoryParams) (*mcp.CallToolResult, any, error) {
-		_, err := validateCall(ctx, checkInventoryTool)
+		_, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -122,9 +122,9 @@ func checkInventoryHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckInvent
 	}
 }
 
-func checkEligibilityHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckEligibilityParams, any] {
+func checkEligibilityHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[CheckEligibilityParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CheckEligibilityParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, checkEligibilityTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -136,9 +136,9 @@ func checkEligibilityHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckElig
 	}
 }
 
-func createReturnHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReturnParams, any] {
+func createReturnHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[CreateReturnParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CreateReturnParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, createReturnTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -150,9 +150,9 @@ func createReturnHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReturnP
 	}
 }
 
-func createReplacementHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReplacementParams, any] {
+func createReplacementHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[CreateReplacementParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CreateReplacementParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, createReplacementTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -164,9 +164,9 @@ func createReplacementHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateRe
 	}
 }
 
-func issueRefundHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueRefundParams, any] {
+func issueRefundHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[IssueRefundParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params IssueRefundParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, issueRefundTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -178,9 +178,9 @@ func issueRefundHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueRefundPar
 	}
 }
 
-func issueCouponHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueCouponParams, any] {
+func issueCouponHandler(svc *commerce.Service, contract toolContract) mcp.ToolHandlerFor[IssueCouponParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params IssueCouponParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, issueCouponTool)
+		meta, err := validateCall(ctx, contract)
 		if err != nil {
 			return nil, nil, err
 		}

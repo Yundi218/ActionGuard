@@ -62,18 +62,17 @@ func limitRequestBody(maxBytes int, next http.Handler) http.Handler {
 
 		originalBody := r.Body
 		defer originalBody.Close()
-		body := make([]byte, maxBytes+1)
-		n, err := io.ReadFull(originalBody, body)
-		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+		body, err := io.ReadAll(io.LimitReader(originalBody, int64(maxBytes)+1))
+		if err != nil {
 			http.Error(w, "invalid request body", http.StatusBadRequest)
 			return
 		}
-		if n > maxBytes {
+		if len(body) > maxBytes {
 			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 			return
 		}
 
-		r.Body = io.NopCloser(bytes.NewReader(body[:n]))
+		r.Body = io.NopCloser(bytes.NewReader(body))
 		next.ServeHTTP(w, r)
 	})
 }
