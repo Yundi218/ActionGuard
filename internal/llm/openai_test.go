@@ -143,6 +143,28 @@ func TestOpenAIPlannerRejectsInvalidResponsesWithoutRetryOrLeakage(t *testing.T)
 	}
 }
 
+func TestOpenAIPlannerRejectsInvalidUTF8ResponseWithoutRetryOrLeakage(t *testing.T) {
+	var attempts atomic.Int32
+	body := []byte(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"goal\":\"body-secret `)
+	body = append(body, 0xff)
+	body = append(body, []byte(`\",\"policy_refs\":[],\"steps\":[{\"id\":\"order\",\"tool\":\"get_order\",\"arguments\":{\"order_id\":\"AG-1042\"},\"depends_on\":[],\"risk\":\"read\",\"success_condition\":\"order.exists\",\"approval_required\":false}]}"}]}]}`)...)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		_, _ = writer.Write(body)
+	}))
+	t.Cleanup(server.Close)
+
+	planner := newTestPlanner(t, server.URL, nil, nil)
+	_, err := planner.Plan(context.Background(), PlanRequest{UserMessage: testUserMessage, ToolContracts: toolkit.Registry()})
+	if !errors.Is(err, ErrInvalidResponse) {
+		t.Fatalf("error = %v, want ErrInvalidResponse", err)
+	}
+	if attempts.Load() != 1 {
+		t.Fatalf("attempts = %d, want 1", attempts.Load())
+	}
+	assertSanitizedError(t, err)
+}
+
 func TestOpenAIPlannerCapsResponseBodiesAtOneMiB(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

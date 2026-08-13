@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"unicode/utf8"
 )
 
 var (
@@ -13,6 +14,9 @@ var (
 )
 
 func rejectDuplicateJSONMembers(data []byte) error {
+	if !utf8.Valid(data) {
+		return errInvalidJSON
+	}
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	if err := consumeJSONValue(decoder); err != nil {
 		return err

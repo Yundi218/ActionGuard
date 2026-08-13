@@ -1,6 +1,9 @@
 package llm
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestRejectDuplicateJSONMembersRecursively(t *testing.T) {
 	tests := []struct {
@@ -20,6 +23,23 @@ func TestRejectDuplicateJSONMembersRecursively(t *testing.T) {
 			err := rejectDuplicateJSONMembers([]byte(test.data))
 			if (err != nil) != test.wantErr {
 				t.Fatalf("error = %v, wantErr %v", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestRejectDuplicateJSONMembersRejectsInvalidUTF8(t *testing.T) {
+	tests := []struct {
+		name string
+		data []byte
+	}{
+		{name: "invalid key", data: []byte{'{', '"', 0xff, '"', ':', '1', '}'}},
+		{name: "invalid value", data: []byte{'{', '"', 'v', 'a', 'l', 'u', 'e', '"', ':', '"', 0xff, '"', '}'}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if err := rejectDuplicateJSONMembers(test.data); !errors.Is(err, errInvalidJSON) {
+				t.Fatalf("error = %v, want errInvalidJSON", err)
 			}
 		})
 	}
