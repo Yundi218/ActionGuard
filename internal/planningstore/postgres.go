@@ -84,9 +84,10 @@ func (s *PostgresStore) SavePlanningSnapshot(ctx context.Context, runID, from, t
 	})
 }
 
-func (s *PostgresStore) TransitionRun(ctx context.Context, runID, from, to string, result json.RawMessage, failureCode, failureDetail string) error {
-	if len(result) == 0 {
-		result = json.RawMessage(`{}`)
+func (s *PostgresStore) TransitionRun(ctx context.Context, runID, from, to string, result RunResult, failureCode, failureDetail string) error {
+	resultJSON, err := json.Marshal(result)
+	if err != nil {
+		return ErrInvalid
 	}
 	tag, err := s.pool.Exec(ctx, `
 		update runs
@@ -96,7 +97,7 @@ func (s *PostgresStore) TransitionRun(ctx context.Context, runID, from, to strin
 		    failure_detail = $6,
 		    updated_at = now()
 		where id = $1 and status = $2
-	`, runID, from, to, result, failureCode, failureDetail)
+	`, runID, from, to, resultJSON, failureCode, failureDetail)
 	if err != nil {
 		return mapDatabaseError(err)
 	}
@@ -108,13 +109,13 @@ func (s *PostgresStore) TransitionRun(ctx context.Context, runID, from, to strin
 
 func (s *PostgresStore) GetRunView(ctx context.Context, runID, userID string) (RunView, error) {
 	var view RunView
+	var resultJSON json.RawMessage
 	err := s.pool.QueryRow(ctx, `
 		select run.id,
 		       run.session_id,
 		       run.status,
 		       run.goal,
 		       run.failure_code,
-		       run.failure_detail,
 		       run.created_at,
 		       run.updated_at,
 		       coalesce(plan.plan_version, 0),
@@ -138,17 +139,19 @@ func (s *PostgresStore) GetRunView(ctx context.Context, runID, userID string) (R
 		&view.Status,
 		&view.Goal,
 		&view.FailureCode,
-		&view.FailureDetail,
 		&view.CreatedAt,
 		&view.UpdatedAt,
 		&view.PlanVersion,
 		&view.Plan,
 		&view.Evidence,
 		&view.Verification,
-		&view.Result,
+		&resultJSON,
 	)
 	if err != nil {
 		return RunView{}, mapDatabaseError(err)
+	}
+	if err := json.Unmarshal(resultJSON, &view.Result); err != nil {
+		return RunView{}, ErrStore
 	}
 	view.CreatedAt = view.CreatedAt.UTC()
 	view.UpdatedAt = view.UpdatedAt.UTC()

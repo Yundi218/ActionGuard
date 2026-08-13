@@ -31,11 +31,29 @@ type PlanningSnapshot struct {
 	Verification json.RawMessage
 }
 
+type RunStepResult struct {
+	StepID   string `json:"step_id"`
+	Tool     string `json:"tool"`
+	Status   string `json:"status"`
+	Replayed bool   `json:"replayed,omitempty"`
+}
+
+type RunResult struct {
+	Summary string          `json:"summary,omitempty"`
+	Steps   []RunStepResult `json:"steps,omitempty"`
+}
+
 type RunView struct {
-	Run
+	ID           string
+	SessionID    string
+	Status       string
+	Goal         string
+	FailureCode  string
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
 	PlanVersion  int
 	Plan         json.RawMessage
 	Evidence     json.RawMessage
 	Verification json.RawMessage
-	Result       json.RawMessage
+	Result       RunResult
 }

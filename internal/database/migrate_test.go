@@ -38,6 +38,16 @@ func TestMigrationFileNamesReturnsEveryNumberedSQLFileInLexicalOrder(t *testing.
 	}
 }
 
+func TestEmbeddedPolicyPlanningMigrationDeclaresVectorExtension(t *testing.T) {
+	migration, err := migrations.FS.ReadFile("002_policy_planning.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(migration), "create extension if not exists vector;") {
+		t.Fatal("migration 002 must declare create extension if not exists vector")
+	}
+}
+
 func TestMigrateCreatesCommerceSchema(t *testing.T) {
 	databaseURL := os.Getenv("TEST_DATABASE_URL")
 	if databaseURL == "" {

@@ -2,7 +2,6 @@ package planningstore
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 )
 
@@ -19,6 +18,6 @@ type Store interface {
 	GetSession(context.Context, string, string) (Session, error)
 	CreateRun(context.Context, Run, string) error
 	SavePlanningSnapshot(context.Context, string, string, string, PlanningSnapshot) error
-	TransitionRun(context.Context, string, string, string, json.RawMessage, string, string) error
+	TransitionRun(context.Context, string, string, string, RunResult, string, string) error
 	GetRunView(context.Context, string, string) (RunView, error)
 }

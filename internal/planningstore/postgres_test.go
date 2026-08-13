@@ -151,18 +151,71 @@ func TestPostgresStoreSavesPlanningSnapshotsWithCompareAndSet(t *testing.T) {
 	}
 }
 
-func TestPostgresStoreTransitionsRunWithSanitizedResult(t *testing.T) {
-	store, _, ctx := newPlanningStoreTest(t)
+func TestPostgresStoreRollsBackSnapshotStateWhenPlanInsertFails(t *testing.T) {
+	store, pool, ctx := newPlanningStoreTest(t)
+	createPlanningSession(t, store, ctx)
+	if err := store.CreateRun(ctx, planningRun("run-snapshot-rollback"), "Plan a replacement"); err != nil {
+		t.Fatal(err)
+	}
+
+	first := PlanningSnapshot{
+		Goal:         "Original goal",
+		PlanVersion:  1,
+		Plan:         json.RawMessage(`{"steps":[{"id":"lookup"}]}`),
+		Evidence:     json.RawMessage(`[]`),
+		Verification: json.RawMessage(`{"valid":true}`),
+	}
+	if err := store.SavePlanningSnapshot(ctx, "run-snapshot-rollback", "planning", "ready", first); err != nil {
+		t.Fatal(err)
+	}
+
+	duplicate := first
+	duplicate.Goal = "Goal that must roll back"
+	if err := store.SavePlanningSnapshot(ctx, "run-snapshot-rollback", "ready", "running", duplicate); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate snapshot error = %v, want ErrConflict", err)
+	}
+
+	var status, goal string
+	if err := pool.QueryRow(ctx, `
+		select status, goal
+		from runs
+		where id = 'run-snapshot-rollback'
+	`).Scan(&status, &goal); err != nil {
+		t.Fatal(err)
+	}
+	if status != "ready" || goal != first.Goal {
+		t.Fatalf("run state after failed plan insert = status %q goal %q, want ready and %q", status, goal, first.Goal)
+	}
+
+	var planCount int
+	if err := pool.QueryRow(ctx, `select count(*) from plans where run_id = 'run-snapshot-rollback'`).Scan(&planCount); err != nil {
+		t.Fatal(err)
+	}
+	if planCount != 1 {
+		t.Fatalf("plan count after failed plan insert = %d, want 1", planCount)
+	}
+}
+
+func TestPostgresStoreTransitionsRunWithTypedPublicResult(t *testing.T) {
+	store, pool, ctx := newPlanningStoreTest(t)
 	createPlanningSession(t, store, ctx)
 	if err := store.CreateRun(ctx, planningRun("run-transition"), "Check my order"); err != nil {
 		t.Fatal(err)
 	}
 
-	result := json.RawMessage(`{"summary":"replacement created","resource_id":"replacement-1"}`)
+	result := RunResult{
+		Summary: "replacement created",
+		Steps: []RunStepResult{{
+			StepID:   "replace",
+			Tool:     "create_replacement",
+			Status:   "succeeded",
+			Replayed: true,
+		}},
+	}
 	if err := store.TransitionRun(ctx, "run-transition", "planning", "succeeded", result, "", ""); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.TransitionRun(ctx, "run-transition", "planning", "failed", json.RawMessage(`{"summary":"stale"}`), "stale", "stale transition"); !errors.Is(err, ErrStateConflict) {
+	if err := store.TransitionRun(ctx, "run-transition", "planning", "failed", RunResult{Summary: "stale"}, "stale", "stale transition"); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("stale transition error = %v, want ErrStateConflict", err)
 	}
 
@@ -170,10 +223,83 @@ func TestPostgresStoreTransitionsRunWithSanitizedResult(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if view.Status != "succeeded" || view.FailureCode != "" || view.FailureDetail != "" {
+	if view.Status != "succeeded" || view.FailureCode != "" {
 		t.Fatalf("run view = %#v", view)
 	}
-	requireJSONEqual(t, view.Result, result)
+	if !reflect.DeepEqual(view.Result, result) {
+		t.Fatalf("result = %#v, want %#v", view.Result, result)
+	}
+
+	var persisted json.RawMessage
+	if err := pool.QueryRow(ctx, `select result_json from runs where id = 'run-transition'`).Scan(&persisted); err != nil {
+		t.Fatal(err)
+	}
+	wantJSON, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireJSONEqual(t, persisted, wantJSON)
+}
+
+func TestPostgresStoreRunViewDropsUnknownResultFieldsAndInternalFailureDetail(t *testing.T) {
+	store, pool, ctx := newPlanningStoreTest(t)
+	createPlanningSession(t, store, ctx)
+	if err := store.CreateRun(ctx, planningRun("run-public-view"), "Check my order"); err != nil {
+		t.Fatal(err)
+	}
+
+	const internalDetail = "provider response contained api-key=secret and database_private.sql failed"
+	if _, err := pool.Exec(ctx, `
+		update runs
+		set status = 'failed',
+		    failure_code = 'provider_unavailable',
+		    failure_detail = $2,
+		    result_json = $3::jsonb
+		where id = $1
+	`, "run-public-view", internalDetail, `{
+		"summary":"Planning could not complete",
+		"provider_response":"secret provider body",
+		"database_error":"select * from database_private",
+		"steps":[{
+			"step_id":"lookup",
+			"tool":"get_order",
+			"status":"failed",
+			"trusted":{"order_id":"private-order"},
+			"untrusted_text":{"note":"provider-controlled"}
+		}]
+	}`); err != nil {
+		t.Fatal(err)
+	}
+
+	view, err := store.GetRunView(ctx, "run-public-view", "user-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if view.FailureCode != "provider_unavailable" {
+		t.Fatalf("failure code = %q, want provider_unavailable", view.FailureCode)
+	}
+	if view.Result.Summary != "Planning could not complete" || len(view.Result.Steps) != 1 {
+		t.Fatalf("public result = %#v", view.Result)
+	}
+
+	publicJSON, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{
+		internalDetail,
+		"failure_detail",
+		"provider_response",
+		"database_error",
+		"trusted",
+		"untrusted_text",
+		"private-order",
+		"provider-controlled",
+	} {
+		if strings.Contains(string(publicJSON), forbidden) {
+			t.Fatalf("public run view contains forbidden %q: %s", forbidden, publicJSON)
+		}
+	}
 }
 
 func TestPostgresStoreMapsDatabaseErrorsWithoutSQLDetails(t *testing.T) {
