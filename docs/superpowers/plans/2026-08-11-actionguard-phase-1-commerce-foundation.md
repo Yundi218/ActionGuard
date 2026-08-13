@@ -1186,9 +1186,10 @@ func main() {
 	server := mcpserver.New(svc)
 	transport := mcp.NewStreamableHTTPHandler(
 		func(*http.Request) *mcp.Server { return server },
-		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true, MaxRequestBodyBytes: 1 << 20},
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
 	)
-	handler := mcpserver.TrustedContextMiddleware(cfg.MCPGatewayToken, transport)
+	limitedTransport := http.MaxBytesHandler(transport, 1<<20)
+	handler := mcpserver.TrustedContextMiddleware(cfg.MCPGatewayToken, limitedTransport)
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", handler)
 	log.Printf("commerce MCP listening on %s/mcp", cfg.MCPAddr)
