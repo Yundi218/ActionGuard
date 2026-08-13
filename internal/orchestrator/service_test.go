@@ -302,6 +302,33 @@ func (f cancelingExecutor) Execute(context.Context, tools.ExecutionRequest) (too
 	return tools.ExecutionResult{Status: tools.StatusFailed}, context.Canceled
 }
 
+type committedCancelingExecutor struct {
+	cancel          context.CancelFunc
+	contextErr      error
+	contextValue    any
+	deadlinePresent bool
+}
+
+func (f *committedCancelingExecutor) Execute(ctx context.Context, _ tools.ExecutionRequest) (tools.ExecutionResult, error) {
+	f.contextErr = ctx.Err()
+	f.contextValue = ctx.Value(cleanupContextKey{})
+	_, f.deadlinePresent = ctx.Deadline()
+	f.cancel()
+	return tools.ExecutionResult{Status: tools.StatusSucceeded}, nil
+}
+
+type deadlineExecutor struct {
+	contextValue any
+	hasDeadline  bool
+}
+
+func (f *deadlineExecutor) Execute(ctx context.Context, _ tools.ExecutionRequest) (tools.ExecutionResult, error) {
+	f.contextValue = ctx.Value(cleanupContextKey{})
+	_, f.hasDeadline = ctx.Deadline()
+	<-ctx.Done()
+	return tools.ExecutionResult{Status: tools.StatusFailed}, ctx.Err()
+}
+
 func TestRunMessageChecksOwnershipBeforeGeneratingOrCallingDependencies(t *testing.T) {
 	calls := []string{}
 	store := &recordingStore{session: planningstore.Session{ID: "owned", UserID: "user_018", Region: "CN"}, calls: &calls, getSessionErr: planningstore.ErrNotFound}
@@ -318,6 +345,17 @@ func TestRunMessageChecksOwnershipBeforeGeneratingOrCallingDependencies(t *testi
 func TestNewRejectsTypedNilDependencies(t *testing.T) {
 	var store *recordingStore
 	_, err := New(Dependencies{Store: store, Resolver: fakeResolver{}, Retriever: &fakeRetriever{}, Planner: &fakePlanner{}, Verifier: verifier.New(fakeFacts{}), Executor: fakeExecutor{}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("error=%v", err)
+	}
+}
+
+func TestNewRejectsNegativeExecutionTimeout(t *testing.T) {
+	_, err := New(Dependencies{
+		Store: &recordingStore{}, Resolver: fakeResolver{}, Retriever: &fakeRetriever{},
+		Planner: &fakePlanner{}, Verifier: verifier.New(fakeFacts{}), Executor: fakeExecutor{},
+		ExecutionTimeout: -time.Nanosecond,
+	})
 	if !errors.Is(err, ErrInvalid) {
 		t.Fatalf("error=%v", err)
 	}
@@ -459,14 +497,65 @@ func TestRunMessageTransitionsHighRiskPlanToWaitingRuntime(t *testing.T) {
 	service.planner = llm.NewFixturePlanner()
 	service.executor = fakeExecutor{calls: &calls, result: tools.ExecutionResult{Status: tools.StatusWaitingRuntime}}
 	service.resolver = querycontext.NewResolverWithClock(fixtureOrderContextReader{}, func() time.Time { return at })
-	view, err := service.RunMessage(context.Background(), auth.Principal{UserID: "user_018", Scopes: []string{"order:read", "eligibility:read", "inventory:read", "replacement:write", "coupon:write"}}, "session", llm.FixtureReplacementCouponMessage)
+	view, err := service.RunMessage(context.Background(), auth.Principal{UserID: "user_018", Scopes: []string{"order:read", "shipment:read", "eligibility:read", "inventory:read", "replacement:write", "coupon:write"}}, "session", llm.FixtureReplacementCouponMessage)
 	if err != nil || view.Status != "waiting_runtime" || len(view.Result.Steps) != 0 {
 		t.Fatalf("view=%#v err=%v", view, err)
 	}
 }
 
-func TestRunMessageCancellationConvergesCreatedRunWithBoundedCleanContext(t *testing.T) {
-	points := []string{"create_run", "resolver", "retriever", "planner", "verifier", "repair", "repair_verifier", "snapshot", "transition_running", "executor", "transition_succeeded", "get_run"}
+func TestRunMessageCallerCancellationAfterDispatchPersistsAndReturnsSuccess(t *testing.T) {
+	calls := []string{}
+	store := &recordingStore{session: planningstore.Session{ID: "session", UserID: "user_018", Region: "CN"}, calls: &calls}
+	plan := agent.ActionPlan{Goal: "lookup", PolicyRefs: []string{}, Steps: []agent.Step{{ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "order.exists"}}}
+	service := newTestService(t, store, &calls, &fakeRetriever{calls: &calls}, &fakePlanner{calls: &calls, plans: []agent.ActionPlan{plan}})
+	requestContext := context.WithValue(context.Background(), cleanupContextKey{}, "request-secret")
+	ctx, cancel := context.WithCancel(requestContext)
+	executor := &committedCancelingExecutor{cancel: cancel}
+	service.executor = executor
+	service.executionTimeout = time.Second
+
+	view, err := service.RunMessage(ctx, auth.Principal{UserID: "user_018", Scopes: []string{"order:read"}}, "session", "Order AG-1042")
+	if err != nil || view.Status != tools.StatusSucceeded || ctx.Err() == nil {
+		t.Fatalf("view=%#v err=%v caller_err=%v, want stored success after caller cancellation", view, err, ctx.Err())
+	}
+	if executor.contextErr != nil || executor.contextValue != nil || !executor.deadlinePresent {
+		t.Fatalf("executor context err/value/deadline = %v/%v/%t", executor.contextErr, executor.contextValue, executor.deadlinePresent)
+	}
+	for _, detail := range store.failureDetails {
+		if detail == "request_canceled" {
+			t.Fatalf("post-dispatch cancellation invoked convergence: calls=%#v", calls)
+		}
+	}
+	service.convergeCanceledRun(view.RunID)
+	if stored := store.runs[view.RunID]; stored.Status != tools.StatusSucceeded || stored.FailureCode != "" {
+		t.Fatalf("cleanup CAS overwrote terminal success: %#v", stored)
+	}
+}
+
+func TestRunMessageExecutionTimeoutPersistsFailureWithoutHanging(t *testing.T) {
+	calls := []string{}
+	store := &recordingStore{session: planningstore.Session{ID: "session", UserID: "user_018", Region: "CN"}, calls: &calls}
+	plan := agent.ActionPlan{Goal: "lookup", PolicyRefs: []string{}, Steps: []agent.Step{{ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "order.exists"}}}
+	service := newTestService(t, store, &calls, &fakeRetriever{calls: &calls}, &fakePlanner{calls: &calls, plans: []agent.ActionPlan{plan}})
+	executor := &deadlineExecutor{}
+	service.executor = executor
+	service.executionTimeout = 20 * time.Millisecond
+
+	started := time.Now()
+	view, err := service.RunMessage(context.WithValue(context.Background(), cleanupContextKey{}, "request-secret"), auth.Principal{UserID: "user_018", Scopes: []string{"order:read"}}, "session", "Order AG-1042")
+	if err != nil || view.Status != tools.StatusFailed || store.runs[view.RunID].FailureCode != "execution_failed" {
+		t.Fatalf("view=%#v err=%v stored=%#v", view, err, store.runs[view.RunID])
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("execution timeout took %s", elapsed)
+	}
+	if executor.contextValue != nil || !executor.hasDeadline {
+		t.Fatalf("executor context value/deadline = %v/%t", executor.contextValue, executor.hasDeadline)
+	}
+}
+
+func TestRunMessageCancellationBeforeDispatchConvergesCreatedRunWithBoundedCleanContext(t *testing.T) {
+	points := []string{"create_run", "resolver", "retriever", "planner", "verifier", "repair", "repair_verifier", "snapshot", "transition_running"}
 	for _, point := range points {
 		t.Run(point, func(t *testing.T) {
 			calls := []string{}
@@ -497,8 +586,6 @@ func TestRunMessageCancellationConvergesCreatedRunWithBoundedCleanContext(t *tes
 					service.verifier = &secondCancelingVerifier{delegate: service.verifier, cancel: cancel}
 				}
 				service.planner = repairPlanner
-			case "executor":
-				service.executor = cancelingExecutor{cancel: cancel}
 			}
 
 			_, err := service.RunMessage(ctx, auth.Principal{UserID: "user_018", Scopes: []string{"order:read"}}, "session", "Order AG-1042")
@@ -512,14 +599,10 @@ func TestRunMessageCancellationConvergesCreatedRunWithBoundedCleanContext(t *tes
 			for _, stored := range base.runs {
 				run = stored
 			}
-			wantStatus := "failed"
-			if point == "transition_succeeded" || point == "get_run" {
-				wantStatus = "succeeded"
+			if run.Status != "failed" {
+				t.Fatalf("status=%q want=failed calls=%#v", run.Status, calls)
 			}
-			if run.Status != wantStatus {
-				t.Fatalf("status=%q want=%q calls=%#v", run.Status, wantStatus, calls)
-			}
-			if wantStatus == "failed" && run.FailureCode != "request_canceled" {
+			if run.FailureCode != "request_canceled" {
 				t.Fatalf("failure code=%q", run.FailureCode)
 			}
 			foundCleanup := false

@@ -14,11 +14,14 @@ func TestDecodeActionPlanAcceptsCanonicalReplacementPlan(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plan.Goal != "replace damaged item" || len(plan.PolicyRefs) != 1 || len(plan.Steps) != 4 {
+	if plan.Goal != "replace damaged item" || len(plan.PolicyRefs) != 1 || len(plan.Steps) != 5 {
 		t.Fatalf("plan = %#v", plan)
 	}
-	if plan.Steps[3].Tool != "create_replacement" || plan.Steps[3].Risk != toolkit.Write {
-		t.Fatalf("terminal step = %#v", plan.Steps[3])
+	if plan.Steps[1].Tool != "get_shipment" || string(plan.Steps[1].Arguments) != `{"order_id":"AG-1042"}` {
+		t.Fatalf("shipment step = %#v", plan.Steps[1])
+	}
+	if plan.Steps[4].Tool != "create_replacement" || plan.Steps[4].Risk != toolkit.Write {
+		t.Fatalf("terminal step = %#v", plan.Steps[4])
 	}
 
 	encoded, err := json.Marshal(plan)
@@ -103,11 +106,12 @@ func validReplacementPlanJSON() []byte {
 	return []byte(`{
 		"goal":"replace damaged item",
 		"policy_refs":["damaged_goods:v3:Replacement eligibility:10-120"],
-		"steps":[
-			{"id":"order","tool":"get_order","arguments":{"order_id":"AG-1042"},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false},
-			{"id":"eligibility","tool":"check_eligibility","arguments":{"order_id":"AG-1042"},"depends_on":["order"],"risk":"read","success_condition":"eligibility.eligible","approval_required":false},
-			{"id":"inventory","tool":"check_inventory","arguments":{"sku":"SKU-RED-42"},"depends_on":[],"risk":"read","success_condition":"inventory.available","approval_required":false},
-			{"id":"replace","tool":"create_replacement","arguments":{"order_id":"AG-1042","sku":"SKU-RED-42","reason":"damaged"},"depends_on":["eligibility","inventory"],"risk":"write","success_condition":"replacement.created","approval_required":false}
+			"steps":[
+				{"id":"order","tool":"get_order","arguments":{"order_id":"AG-1042"},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false},
+				{"id":"shipment","tool":"get_shipment","arguments":{"order_id":"AG-1042"},"depends_on":["order"],"risk":"read","success_condition":"shipment.exists","approval_required":false},
+				{"id":"eligibility","tool":"check_eligibility","arguments":{"order_id":"AG-1042"},"depends_on":["order"],"risk":"read","success_condition":"eligibility.eligible","approval_required":false},
+				{"id":"inventory","tool":"check_inventory","arguments":{"sku":"SKU-RED-42"},"depends_on":[],"risk":"read","success_condition":"inventory.available","approval_required":false},
+				{"id":"replace","tool":"create_replacement","arguments":{"order_id":"AG-1042","sku":"SKU-RED-42","reason":"damaged"},"depends_on":["shipment","eligibility","inventory"],"risk":"write","success_condition":"replacement.created","approval_required":false}
 		]
 	}`)
 }

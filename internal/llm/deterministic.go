@@ -41,7 +41,7 @@ func (*FixturePlanner) Plan(ctx context.Context, request PlanRequest) (agent.Act
 		}
 		return fixtureOrderLookupPlan(), nil
 	case FixtureReplacementMessage:
-		if !hasFixtureContracts(request.ToolContracts, "get_order", "check_eligibility", "check_inventory", "create_replacement") {
+		if !hasFixtureContracts(request.ToolContracts, "get_order", "get_shipment", "check_eligibility", "check_inventory", "create_replacement") {
 			return agent.ActionPlan{}, ErrUnsupportedFixture
 		}
 		damaged, ok := fixtureCitation(request.Evidence, "damaged_goods")
@@ -50,7 +50,7 @@ func (*FixturePlanner) Plan(ctx context.Context, request PlanRequest) (agent.Act
 		}
 		return fixtureReplacementPlan([]string{damaged}, false), nil
 	case FixtureReplacementCouponMessage:
-		if !hasFixtureContracts(request.ToolContracts, "get_order", "check_eligibility", "check_inventory", "create_replacement", "issue_coupon") {
+		if !hasFixtureContracts(request.ToolContracts, "get_order", "get_shipment", "check_eligibility", "check_inventory", "create_replacement", "issue_coupon") {
 			return agent.ActionPlan{}, ErrUnsupportedFixture
 		}
 		damaged, hasDamaged := fixtureCitation(request.Evidence, "damaged_goods")
@@ -83,9 +83,10 @@ func fixtureReplacementPlan(policyRefs []string, includeCoupon bool) agent.Actio
 		Goal: "replace damaged item", PolicyRefs: append([]string{}, policyRefs...),
 		Steps: []agent.Step{
 			{ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "order.exists"},
+			{ID: "shipment", Tool: "get_shipment", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{"order"}, Risk: toolkit.Read, SuccessCondition: "shipment.exists"},
 			{ID: "eligibility", Tool: "check_eligibility", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{"order"}, Risk: toolkit.Read, SuccessCondition: "eligibility.eligible"},
 			{ID: "inventory", Tool: "check_inventory", Arguments: json.RawMessage(`{"sku":"HP-71"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "inventory.available"},
-			{ID: "replace", Tool: "create_replacement", Arguments: json.RawMessage(`{"order_id":"AG-1042","sku":"HP-71","reason":"damaged item"}`), DependsOn: []string{"eligibility", "inventory"}, Risk: toolkit.Write, SuccessCondition: "replacement.created"},
+			{ID: "replace", Tool: "create_replacement", Arguments: json.RawMessage(`{"order_id":"AG-1042","sku":"HP-71","reason":"damaged item"}`), DependsOn: []string{"shipment", "eligibility", "inventory"}, Risk: toolkit.Write, SuccessCondition: "replacement.created"},
 		},
 	}
 	if includeCoupon {

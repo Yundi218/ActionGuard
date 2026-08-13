@@ -94,6 +94,12 @@ func (planner *recordingPlanner) callCount() int {
 type toolCallRecorder struct {
 	next  http.Handler
 	calls atomic.Int64
+
+	mu                sync.Mutex
+	shipmentCalls     int
+	shipmentTrusted   json.RawMessage
+	shipmentUntrusted map[string]string
+	shipmentError     string
 }
 
 func (recorder *toolCallRecorder) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
@@ -102,7 +108,76 @@ func (recorder *toolCallRecorder) ServeHTTP(writer http.ResponseWriter, request 
 		request.Body = io.NopCloser(bytes.NewReader(body))
 		recorder.calls.Add(int64(countRPCMethod(body, "tools/call")))
 	}
-	recorder.next.ServeHTTP(writer, request)
+
+	captured := httptest.NewRecorder()
+	recorder.next.ServeHTTP(captured, request)
+	if toolNameFromRPCRequest(body) == "get_shipment" {
+		recorder.recordShipmentResponse(captured.Body.Bytes())
+	}
+	for name, values := range captured.Header() {
+		writer.Header()[name] = append([]string(nil), values...)
+	}
+	writer.WriteHeader(captured.Code)
+	_, _ = writer.Write(captured.Body.Bytes())
+}
+
+func toolNameFromRPCRequest(body []byte) string {
+	var request struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if json.Unmarshal(body, &request) != nil || request.Method != "tools/call" {
+		return ""
+	}
+	return request.Params.Name
+}
+
+func (recorder *toolCallRecorder) recordShipmentResponse(body []byte) {
+	var response struct {
+		Result struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"result"`
+	}
+	var envelope struct {
+		Trusted       json.RawMessage   `json:"trusted"`
+		UntrustedText map[string]string `json:"untrusted_text"`
+	}
+	errText := ""
+	if err := json.Unmarshal(body, &response); err != nil {
+		errText = "decode JSON-RPC response: " + err.Error()
+	} else if len(response.Result.Content) != 1 || response.Result.Content[0].Type != "text" {
+		errText = "shipment response does not contain exactly one text item"
+	} else if err := json.Unmarshal([]byte(response.Result.Content[0].Text), &envelope); err != nil {
+		errText = "decode shipment envelope: " + err.Error()
+	}
+
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	recorder.shipmentCalls++
+	if errText != "" {
+		recorder.shipmentError = errText
+		return
+	}
+	recorder.shipmentTrusted = append(json.RawMessage(nil), envelope.Trusted...)
+	recorder.shipmentUntrusted = make(map[string]string, len(envelope.UntrustedText))
+	for key, value := range envelope.UntrustedText {
+		recorder.shipmentUntrusted[key] = value
+	}
+}
+
+func (recorder *toolCallRecorder) shipmentObservation() (int, json.RawMessage, map[string]string, string) {
+	recorder.mu.Lock()
+	defer recorder.mu.Unlock()
+	untrusted := make(map[string]string, len(recorder.shipmentUntrusted))
+	for key, value := range recorder.shipmentUntrusted {
+		untrusted[key] = value
+	}
+	return recorder.shipmentCalls, append(json.RawMessage(nil), recorder.shipmentTrusted...), untrusted, recorder.shipmentError
 }
 
 func countRPCMethod(body []byte, method string) int {
@@ -165,6 +240,13 @@ func TestPolicyConstrainedReplacementFlow(t *testing.T) {
 	})
 
 	prepareE2EDatabase(t, ctx, pool)
+	var storedShipmentNote string
+	if err := pool.QueryRow(ctx, `select untrusted_note from shipments where order_id = 'AG-1042'`).Scan(&storedShipmentNote); err != nil {
+		t.Fatal(err)
+	}
+	if storedShipmentNote != maliciousShipmentText {
+		t.Fatalf("stored shipment note = %q, want malicious fixture", storedShipmentNote)
+	}
 	commerceService := commerce.NewServiceWithClock(commerce.NewPostgresStore(pool), func() time.Time { return e2eNow })
 	ownedOrder, err := commerceService.ResolveOrderContext(ctx, "user_018", "AG-1042")
 	if err != nil {
@@ -271,8 +353,21 @@ func TestPolicyConstrainedReplacementFlow(t *testing.T) {
 	if status != http.StatusOK || replacementRun.Status != tools.StatusSucceeded {
 		t.Fatalf("replacement = status %d run %#v body=%s", status, replacementRun, body)
 	}
-	if calls := toolCalls.calls.Load() - toolCallsBefore; calls != 4 {
-		t.Fatalf("replacement MCP tool calls = %d, want 4", calls)
+	if calls := toolCalls.calls.Load() - toolCallsBefore; calls != 5 {
+		t.Fatalf("replacement MCP tool calls = %d, want 5", calls)
+	}
+	shipmentCalls, shipmentTrusted, shipmentUntrusted, shipmentError := toolCalls.shipmentObservation()
+	if shipmentError != "" {
+		t.Fatal(shipmentError)
+	}
+	if shipmentCalls != 1 {
+		t.Fatalf("get_shipment calls = %d, want 1", shipmentCalls)
+	}
+	if shipmentUntrusted["untrusted_note"] != maliciousShipmentText {
+		t.Fatalf("shipment untrusted_text = %#v, want malicious note", shipmentUntrusted)
+	}
+	if strings.Contains(string(shipmentTrusted), maliciousShipmentText) || strings.Contains(string(shipmentTrusted), "untrusted_note") {
+		t.Fatalf("shipment trusted payload contains untrusted data: %s", shipmentTrusted)
 	}
 	assertVerifiedReplacement(t, replacementRun)
 	requireCommerceCounts(t, ctx, pool, commerceCounts{replacements: 1, idempotency: 1, available: 11, reserved: 1})
@@ -380,10 +475,10 @@ func assertVerifiedReplacement(t *testing.T, run orchestrator.RunView) {
 	if run.Plan == nil || run.Verification == nil || !run.Verification.Valid {
 		t.Fatalf("replacement plan was not typed and verified: %#v", run)
 	}
-	if run.Plan.Goal != "replace damaged item" || len(run.Plan.Steps) != 4 {
+	if run.Plan.Goal != "replace damaged item" || len(run.Plan.Steps) != 5 {
 		t.Fatalf("replacement plan = %#v", run.Plan)
 	}
-	wantTools := []string{"get_order", "check_eligibility", "check_inventory", "create_replacement"}
+	wantTools := []string{"get_order", "get_shipment", "check_eligibility", "check_inventory", "create_replacement"}
 	for index, step := range run.Plan.Steps {
 		if step.Tool != wantTools[index] {
 			t.Fatalf("step %d tool = %q, want %q", index, step.Tool, wantTools[index])
@@ -392,8 +487,8 @@ func assertVerifiedReplacement(t *testing.T, run orchestrator.RunView) {
 			t.Fatalf("replacement-only step %q unexpectedly requires approval", step.ID)
 		}
 	}
-	if run.Plan.Steps[3].Risk != toolkit.Write {
-		t.Fatalf("replacement risk = %q", run.Plan.Steps[3].Risk)
+	if run.Plan.Steps[4].Risk != toolkit.Write {
+		t.Fatalf("replacement risk = %q", run.Plan.Steps[4].Risk)
 	}
 	if len(run.Evidence) == 0 || len(run.Evidence) > 5 {
 		t.Fatalf("evidence count = %d", len(run.Evidence))

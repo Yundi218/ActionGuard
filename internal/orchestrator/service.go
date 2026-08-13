@@ -32,7 +32,11 @@ var (
 	ErrService  = errors.New("service unavailable")
 )
 
-const cancellationCleanupTimeout = 500 * time.Millisecond
+const (
+	cancellationCleanupTimeout = 500 * time.Millisecond
+	defaultExecutionTimeout    = 35 * time.Second
+	terminalPersistenceTimeout = 2 * time.Second
+)
 
 type Store interface {
 	planningstore.Store
@@ -55,25 +59,27 @@ type PlanExecutor interface {
 }
 
 type Dependencies struct {
-	Store     Store
-	Resolver  ContextResolver
-	Retriever PolicyRetriever
-	Planner   llm.Planner
-	Verifier  PlanVerifier
-	Executor  PlanExecutor
-	Now       func() time.Time
-	Random    io.Reader
+	Store            Store
+	Resolver         ContextResolver
+	Retriever        PolicyRetriever
+	Planner          llm.Planner
+	Verifier         PlanVerifier
+	Executor         PlanExecutor
+	ExecutionTimeout time.Duration
+	Now              func() time.Time
+	Random           io.Reader
 }
 
 type Service struct {
-	store     Store
-	resolver  ContextResolver
-	retriever PolicyRetriever
-	planner   llm.Planner
-	verifier  PlanVerifier
-	executor  PlanExecutor
-	now       func() time.Time
-	random    io.Reader
+	store            Store
+	resolver         ContextResolver
+	retriever        PolicyRetriever
+	planner          llm.Planner
+	verifier         PlanVerifier
+	executor         PlanExecutor
+	executionTimeout time.Duration
+	now              func() time.Time
+	random           io.Reader
 }
 
 type EvidenceView struct {
@@ -117,10 +123,16 @@ func New(dependencies Dependencies) (*Service, error) {
 	if dependencies.Now == nil {
 		dependencies.Now = time.Now
 	}
+	if dependencies.ExecutionTimeout < 0 {
+		return nil, ErrInvalid
+	}
+	if dependencies.ExecutionTimeout == 0 {
+		dependencies.ExecutionTimeout = defaultExecutionTimeout
+	}
 	if dependencies.Random == nil {
 		dependencies.Random = rand.Reader
 	}
-	return &Service{store: dependencies.Store, resolver: dependencies.Resolver, retriever: dependencies.Retriever, planner: dependencies.Planner, verifier: dependencies.Verifier, executor: dependencies.Executor, now: dependencies.Now, random: dependencies.Random}, nil
+	return &Service{store: dependencies.Store, resolver: dependencies.Resolver, retriever: dependencies.Retriever, planner: dependencies.Planner, verifier: dependencies.Verifier, executor: dependencies.Executor, executionTimeout: dependencies.ExecutionTimeout, now: dependencies.Now, random: dependencies.Random}, nil
 }
 
 func nilDependency(value any) bool {
@@ -293,21 +305,15 @@ func (service *Service) RunMessage(ctx context.Context, principal auth.Principal
 		}
 		return RunView{}, mapStoreError(ctx, err)
 	}
-	if ctx.Err() != nil {
-		return service.cancelCreatedRun(runID)
-	}
-	execution, executeErr := service.executor.Execute(ctx, tools.ExecutionRequest{RunID: runID, Plan: sealed})
-	if ctx.Err() != nil {
-		return service.cancelCreatedRun(runID)
-	}
-	if executeErr != nil {
-		if isCancellation(ctx, executeErr) {
-			return service.cancelCreatedRun(runID)
-		}
-		return service.failAndGet(ctx, principal, runID, "running", "execution_failed")
-	}
+	return service.executeAndPersist(runID, principal, sealed)
+}
+
+func (service *Service) executeAndPersist(runID string, principal auth.Principal, sealed verifier.VerifiedPlan) (RunView, error) {
+	executionContext, cancelExecution := context.WithTimeout(context.Background(), service.executionTimeout)
+	execution, executeErr := service.executor.Execute(executionContext, tools.ExecutionRequest{RunID: runID, Plan: sealed})
+	cancelExecution()
 	target := execution.Status
-	if target != tools.StatusSucceeded && target != tools.StatusWaitingRuntime && target != tools.StatusFailed {
+	if executeErr != nil || target != tools.StatusSucceeded && target != tools.StatusWaitingRuntime && target != tools.StatusFailed {
 		target = tools.StatusFailed
 	}
 	result := sanitizeExecution(execution)
@@ -317,16 +323,12 @@ func (service *Service) RunMessage(ctx context.Context, principal auth.Principal
 		code = "execution_failed"
 		detail = "execution_failed"
 	}
-	if err := service.store.TransitionRun(ctx, runID, "running", target, result, code, detail); err != nil {
-		if isCancellation(ctx, err) {
-			return service.cancelCreatedRun(runID)
-		}
-		return RunView{}, mapStoreError(ctx, err)
+	persistenceContext, cancelPersistence := context.WithTimeout(context.Background(), terminalPersistenceTimeout)
+	defer cancelPersistence()
+	if err := service.store.TransitionRun(persistenceContext, runID, "running", target, result, code, detail); err != nil {
+		return RunView{}, mapStoreError(persistenceContext, err)
 	}
-	if ctx.Err() != nil {
-		return service.cancelCreatedRun(runID)
-	}
-	return service.getCreatedRun(ctx, principal, runID)
+	return service.GetRun(persistenceContext, principal, runID)
 }
 
 func (service *Service) GetRun(ctx context.Context, principal auth.Principal, runID string) (RunView, error) {

@@ -298,7 +298,7 @@ func TestServiceEligibilityRequiresDeliveredStatusAndTimestamp(t *testing.T) {
 	}
 }
 
-func TestServiceCreateReturnRequiresEligibilityAndForwardsArguments(t *testing.T) {
+func TestServiceCreateReturnForwardsArgumentsToTransactionalStore(t *testing.T) {
 	delivered := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	store := &fakeStore{order: ownedDeliveredOrder(delivered), result: WriteResult{ResourceType: "return", ResourceID: "return-1"}}
 	result, err := NewServiceWithClock(store, func() time.Time { return delivered }).CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key-1")
@@ -307,42 +307,40 @@ func TestServiceCreateReturnRequiresEligibilityAndForwardsArguments(t *testing.T
 	}
 }
 
-func TestServiceCreateReturnRejectsIneligibleOrder(t *testing.T) {
-	store := &fakeStore{order: Order{ID: "AG-1042", UserID: "user_018", Status: "shipped"}}
+func TestServiceCreateReturnPropagatesTransactionalIneligibility(t *testing.T) {
+	store := &fakeStore{returnErr: ErrIneligible}
 	_, err := NewService(store).CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key-1")
-	if !errors.Is(err, ErrIneligible) || len(store.returnCalls) != 0 {
+	if !errors.Is(err, ErrIneligible) || len(store.returnCalls) != 1 {
 		t.Fatalf("err = %v, calls = %#v", err, store.returnCalls)
 	}
 }
 
-func TestServiceCreateReplacementRejectsIneligibleOrderWithoutCheckingInventoryOrWriting(t *testing.T) {
-	store := &fakeStore{order: Order{ID: "AG-1042", UserID: "user_018", Status: "shipped"}}
+func TestServiceCreateReplacementPropagatesTransactionalIneligibility(t *testing.T) {
+	store := &fakeStore{replacementErr: ErrIneligible}
 	_, err := NewService(store).CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-BLUE-7", "wrong size", "replacement-key-1")
-	if !errors.Is(err, ErrIneligible) || len(store.inventorySKUs) != 0 || len(store.replaceCalls) != 0 {
+	if !errors.Is(err, ErrIneligible) || len(store.inventorySKUs) != 0 || len(store.replaceCalls) != 1 {
 		t.Fatalf("err = %v, inventory calls = %#v, replacement calls = %#v", err, store.inventorySKUs, store.replaceCalls)
 	}
 }
 
-func TestServiceCreateReplacementRequiresPositiveInventoryAndForwardsArguments(t *testing.T) {
+func TestServiceCreateReplacementForwardsArgumentsAndPropagatesTransactionalInventoryErrors(t *testing.T) {
 	delivered := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	tests := []struct {
-		name      string
-		available int
-		wantErr   error
-		wantCalls int
+		name     string
+		storeErr error
+		wantErr  error
 	}{
-		{name: "positive", available: 1, wantCalls: 1},
-		{name: "zero", available: 0, wantErr: ErrInventoryEmpty},
-		{name: "negative", available: -1, wantErr: ErrInventoryEmpty},
+		{name: "available"},
+		{name: "empty", storeErr: ErrInventoryEmpty, wantErr: ErrInventoryEmpty},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			store := &fakeStore{order: ownedDeliveredOrder(delivered), inventory: Inventory{SKU: "SKU-BLUE-7", Available: tt.available}, result: WriteResult{ResourceID: "replacement-1"}}
+			store := &fakeStore{replacementErr: tt.storeErr, result: WriteResult{ResourceID: "replacement-1"}}
 			result, err := NewServiceWithClock(store, func() time.Time { return delivered }).CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-BLUE-7", "wrong size", "replacement-key-1")
-			if !errors.Is(err, tt.wantErr) || len(store.replaceCalls) != tt.wantCalls {
+			if !errors.Is(err, tt.wantErr) || len(store.replaceCalls) != 1 || len(store.inventorySKUs) != 0 {
 				t.Fatalf("result = %#v, err = %v, calls = %#v", result, err, store.replaceCalls)
 			}
-			if tt.wantCalls == 1 && store.replaceCalls[0] != (replacementCall{"AG-1042", "SKU-BLUE-7", "wrong size", "replacement-key-1"}) {
+			if store.replaceCalls[0] != (replacementCall{"AG-1042", "SKU-BLUE-7", "wrong size", "replacement-key-1"}) {
 				t.Fatalf("calls = %#v", store.replaceCalls)
 			}
 		})
@@ -464,10 +462,6 @@ func TestServicePropagatesErrorsFromReachedStoreMethods(t *testing.T) {
 			_, err := s.CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key")
 			return err
 		}},
-		{name: "create replacement inventory", store: &fakeStore{inventoryErr: errStorage}, call: func(s *Service) error {
-			_, err := s.CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
-			return err
-		}},
 		{name: "create replacement write", store: &fakeStore{replacementErr: errStorage}, call: func(s *Service) error {
 			_, err := s.CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
 			return err
@@ -509,13 +503,11 @@ func TestServiceForwardsContextToEveryReachedStoreMethod(t *testing.T) {
 		{name: "create return", call: func(s *Service) error {
 			_, err := s.CreateReturn(ctx, "user_018", "AG-1042", "damaged", "return-key")
 			return err
-		}, contexts: func(f *fakeStore) []context.Context { return append(f.getOrderContexts, f.returnContexts...) }},
+		}, contexts: func(f *fakeStore) []context.Context { return f.returnContexts }},
 		{name: "create replacement", call: func(s *Service) error {
 			_, err := s.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
 			return err
-		}, contexts: func(f *fakeStore) []context.Context {
-			return append(append(f.getOrderContexts, f.inventoryContexts...), f.replacementContexts...)
-		}},
+		}, contexts: func(f *fakeStore) []context.Context { return f.replacementContexts }},
 		{name: "issue refund", call: func(s *Service) error {
 			_, err := s.IssueRefund(ctx, "user_018", "AG-1042", 100, "refund-key")
 			return err

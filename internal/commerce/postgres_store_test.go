@@ -645,35 +645,33 @@ func TestPostgresStoreConcurrentDifferentKeyRefundsRespectLockedBalance(t *testi
 func TestPostgresStoreConcurrentDifferentKeyReplacementsRespectLockedInventory(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	if _, err := store.pool.Exec(ctx, `update inventory set available = 1 where sku = 'SKU-RED-42'`); err != nil {
-		t.Fatal(err)
-	}
+	svc := NewServiceWithClock(store, func() time.Time { return postgresStoreTestTime })
 	start := make(chan struct{})
-	errs := make(chan error, 2)
+	type outcome struct {
+		result WriteResult
+		err    error
+	}
+	outcomes := make(chan outcome, 2)
 	for _, key := range []string{"replacement-concurrent-a", "replacement-concurrent-b"} {
 		key := key
 		go func() {
 			<-start
-			_, err := store.CreateReplacement(ctx, postgresStoreTestIdentity(createReplacementOperation, key), "AG-1042", "SKU-RED-42", "damaged", postgresStoreTestTime)
-			errs <- err
+			result, err := svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", key)
+			outcomes <- outcome{result: result, err: err}
 		}()
 	}
 	close(start)
 
-	var successes, emptyInventory int
+	var results []WriteResult
 	for range 2 {
-		err := <-errs
-		switch {
-		case err == nil:
-			successes++
-		case errors.Is(err, ErrInventoryEmpty):
-			emptyInventory++
-		default:
-			t.Fatalf("unexpected replacement error: %v", err)
+		outcome := <-outcomes
+		if outcome.err != nil {
+			t.Fatalf("concurrent replacement error: %v", outcome.err)
 		}
+		results = append(results, outcome.result)
 	}
-	if successes != 1 || emptyInventory != 1 {
-		t.Fatalf("successes=%d empty_inventory=%d", successes, emptyInventory)
+	if results[0].ResourceID == "" || results[0].ResourceID != results[1].ResourceID || results[0].Replayed == results[1].Replayed {
+		t.Fatalf("concurrent replacement results = %#v, want one create and one replay of the same resource", results)
 	}
 
 	var replacements, idempotency, available, reserved int
@@ -686,8 +684,162 @@ func TestPostgresStoreConcurrentDifferentKeyReplacementsRespectLockedInventory(t
 	if err := store.pool.QueryRow(ctx, `select available, reserved from inventory where sku = 'SKU-RED-42'`).Scan(&available, &reserved); err != nil {
 		t.Fatal(err)
 	}
-	if replacements != 1 || idempotency != 1 || available != 0 || reserved != 1 {
+	if replacements != 1 || idempotency != 2 || available != 3 || reserved != 1 {
 		t.Fatalf("database state: replacements=%d idempotency=%d available=%d reserved=%d", replacements, idempotency, available, reserved)
+	}
+	assertIdempotencyAliases(t, store, createReplacementOperation, []string{"replacement-concurrent-a", "replacement-concurrent-b"}, results[0].ResourceID)
+}
+
+func TestPostgresStoreDifferentRunKeysReplayActiveOrderOperation(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		operation string
+		write     func(context.Context, *Service, string, string) (WriteResult, error)
+		countSQL  string
+	}{
+		{
+			name:      "return",
+			operation: createReturnOperation,
+			write: func(ctx context.Context, svc *Service, key, reason string) (WriteResult, error) {
+				return svc.CreateReturn(ctx, "user_018", "AG-1042", reason, key)
+			},
+			countSQL: `select count(*) from returns`,
+		},
+		{
+			name:      "replacement",
+			operation: createReplacementOperation,
+			write: func(ctx context.Context, svc *Service, key, reason string) (WriteResult, error) {
+				return svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", reason, key)
+			},
+			countSQL: `select count(*) from replacements`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			now := postgresStoreTestTime
+			svc := NewServiceWithClock(store, func() time.Time { return now })
+			keys := []string{tt.name + "-run-a", tt.name + "-run-b"}
+			if tt.name == "replacement" {
+				if _, err := store.pool.Exec(ctx, `update inventory set available = 1 where sku = 'SKU-RED-42'`); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			first, err := tt.write(ctx, svc, keys[0], "damaged")
+			if err != nil {
+				t.Fatal(err)
+			}
+			now = time.Date(2026, 9, 1, 12, 0, 0, 1, time.UTC)
+			second, err := tt.write(ctx, svc, keys[1], "damaged")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if first.ResourceID == "" || first.Replayed || second.ResourceID != first.ResourceID || !second.Replayed {
+				t.Fatalf("first/second = %#v/%#v, want cross-run replay", first, second)
+			}
+			sameRun, err := tt.write(ctx, svc, keys[1], "damaged")
+			if err != nil || sameRun != second {
+				t.Fatalf("same-run alias replay = %#v/%v, want exact %#v", sameRun, err, second)
+			}
+
+			conflict, err := tt.write(ctx, svc, tt.name+"-run-c", "wrong item")
+			if !errors.Is(err, ErrIdempotencyConflict) || conflict != (WriteResult{}) {
+				t.Fatalf("changed-argument result/error = %#v/%v, want sanitized conflict", conflict, err)
+			}
+
+			var rows int
+			if err := store.pool.QueryRow(ctx, tt.countSQL).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			var aliases int
+			if err := store.pool.QueryRow(ctx, `select count(*) from idempotency_records where operation = $1`, tt.operation).Scan(&aliases); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 1 || aliases != 2 {
+				t.Fatalf("rows=%d aliases=%d, want one resource and two successful run aliases", rows, aliases)
+			}
+			assertIdempotencyAliases(t, store, tt.operation, keys, first.ResourceID)
+			if tt.name == "replacement" {
+				inventory, err := store.GetInventory(ctx, "SKU-RED-42")
+				if err != nil || inventory.Available != 0 || inventory.Reserved != 1 {
+					t.Fatalf("replacement replay inventory = %#v, %v", inventory, err)
+				}
+			}
+		})
+	}
+}
+
+func TestPostgresStoreTerminalOrderOperationAllowsNewRun(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		operation string
+		write     func(context.Context, *Service, string) (WriteResult, error)
+		closeSQL  string
+		countSQL  string
+	}{
+		{
+			name:      "closed return",
+			operation: createReturnOperation,
+			write: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReturn(ctx, "user_018", "AG-1042", "damaged", key)
+			},
+			closeSQL: `update returns set status = 'closed'`,
+			countSQL: `select count(*) from returns`,
+		},
+		{
+			name:      "canceled replacement",
+			operation: createReplacementOperation,
+			write: func(ctx context.Context, svc *Service, key string) (WriteResult, error) {
+				return svc.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", key)
+			},
+			closeSQL: `update replacements set status = 'cancelled'`,
+			countSQL: `select count(*) from replacements`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			svc := NewServiceWithClock(store, func() time.Time { return postgresStoreTestTime })
+			first, err := tt.write(ctx, svc, tt.operation+"-terminal-a")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := store.pool.Exec(ctx, tt.closeSQL); err != nil {
+				t.Fatal(err)
+			}
+			second, err := tt.write(ctx, svc, tt.operation+"-terminal-b")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if second.Replayed || second.ResourceID == first.ResourceID {
+				t.Fatalf("terminal operation was replayed: first/second = %#v/%#v", first, second)
+			}
+			var rows int
+			if err := store.pool.QueryRow(ctx, tt.countSQL).Scan(&rows); err != nil {
+				t.Fatal(err)
+			}
+			if rows != 2 {
+				t.Fatalf("resource rows = %d, want 2", rows)
+			}
+		})
+	}
+}
+
+func assertIdempotencyAliases(t *testing.T, store *PostgresStore, operation string, keys []string, resourceID string) {
+	t.Helper()
+	for _, key := range keys {
+		var gotID string
+		if err := store.pool.QueryRow(context.Background(), `
+			select result_id
+			from idempotency_records
+			where operation = $1 and idempotency_key = $2
+		`, operation, key).Scan(&gotID); err != nil {
+			t.Fatal(err)
+		}
+		if gotID != resourceID {
+			t.Fatalf("alias %s/%s result_id = %q, want %q", operation, key, gotID, resourceID)
+		}
 	}
 }
 

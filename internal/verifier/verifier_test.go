@@ -51,14 +51,14 @@ func (reader *mutatingFactReader) GetOrder(_ context.Context, _, _ string) (comm
 	reader.plan.PolicyRefs[0] = "attacker:policy"
 	reader.plan.Steps[0].Arguments[2] = 'X'
 	reader.plan.Steps[1].DependsOn[0] = "attacker-step"
-	reader.plan.Steps[3].Tool = "issue_coupon"
+	reader.plan.Steps[4].Tool = "issue_coupon"
 	return reader.order, nil
 }
 
 func TestVerifyAndSealAcceptsReplacementAndBindsPrivateContext(t *testing.T) {
 	plan, verificationContext, reader := validReplacementFixture()
 	verificationContext.Scopes = []string{
-		"replacement:write", "order:read", "inventory:read", "eligibility:read", "order:read",
+		"replacement:write", "order:read", "shipment:read", "inventory:read", "eligibility:read", "order:read",
 	}
 
 	sealed, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
@@ -68,7 +68,7 @@ func TestVerifyAndSealAcceptsReplacementAndBindsPrivateContext(t *testing.T) {
 	if sealed.UserID() != verificationContext.UserID {
 		t.Fatalf("UserID() = %q, want %q", sealed.UserID(), verificationContext.UserID)
 	}
-	wantScopes := []string{"eligibility:read", "inventory:read", "order:read", "replacement:write"}
+	wantScopes := []string{"eligibility:read", "inventory:read", "order:read", "replacement:write", "shipment:read"}
 	if got := sealed.Scopes(); !reflect.DeepEqual(got, wantScopes) {
 		t.Fatalf("Scopes() = %#v, want %#v", got, wantScopes)
 	}
@@ -98,6 +98,19 @@ func TestVerifyAndSealAcceptsReplacementAndBindsPrivateContext(t *testing.T) {
 	}
 }
 
+func TestVerifierRequiresShipmentBeforeReplacement(t *testing.T) {
+	plan, verificationContext, reader := validReplacementFixture()
+	_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+	if !result.Valid {
+		t.Fatalf("shipment-aware replacement result = %#v, want valid", result)
+	}
+
+	plan.Steps = append(plan.Steps[:1], plan.Steps[2:]...)
+	plan.Steps[3].DependsOn = []string{"eligibility", "inventory"}
+	_, result = New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+	requireErrorCode(t, result, "missing_prerequisite")
+}
+
 func TestVerifyAndSealSnapshotsPlanBeforeFactCallbacks(t *testing.T) {
 	plan, verificationContext, _ := validReplacementFixture()
 	want := clonePlan(plan)
@@ -122,11 +135,11 @@ func TestVerifierRejectsInvalidStructureAndContracts(t *testing.T) {
 		mutate func(*agent.ActionPlan)
 	}{
 		{name: "unknown dependency", code: "unknown_dependency", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps[3].DependsOn = append(plan.Steps[3].DependsOn, "missing")
+			plan.Steps[4].DependsOn = append(plan.Steps[4].DependsOn, "missing")
 		}},
 		{name: "missing required prerequisite", code: "missing_prerequisite", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps = append(plan.Steps[:2], plan.Steps[3])
-			plan.Steps[2].DependsOn = []string{"eligibility"}
+			plan.Steps = append([]agent.Step{plan.Steps[0]}, plan.Steps[2:]...)
+			plan.Steps[3].DependsOn = []string{"eligibility", "inventory"}
 		}},
 		{name: "self dependency", code: "self_dependency", mutate: func(plan *agent.ActionPlan) {
 			plan.Steps[0].DependsOn = []string{"order"}
@@ -138,27 +151,27 @@ func TestVerifierRejectsInvalidStructureAndContracts(t *testing.T) {
 			plan.Steps[1].ID = "order"
 		}},
 		{name: "outside terminal prerequisite graph", code: "prerequisite_not_allowed", mutate: func(plan *agent.ActionPlan) {
-			shipment := agent.Step{ID: "shipment", Tool: "get_shipment", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{"order"}, Risk: toolkit.Read, SuccessCondition: "shipment.exists"}
-			plan.Steps = append(plan.Steps, shipment)
-			plan.Steps[3].DependsOn = append(plan.Steps[3].DependsOn, "shipment")
+			refund := agent.Step{ID: "refund", Tool: "issue_refund", Arguments: json.RawMessage(`{"order_id":"AG-1042","amount_cents":100}`), DependsOn: []string{"order"}, Risk: toolkit.HighRiskWrite, SuccessCondition: "refund.created", ApprovalRequired: true}
+			plan.Steps = append(plan.Steps, refund)
+			plan.Steps[4].DependsOn = append(plan.Steps[4].DependsOn, "refund")
 		}},
 		{name: "duplicate tool and arguments", code: "duplicate_action", mutate: func(plan *agent.ActionPlan) {
-			duplicate := cloneStep(plan.Steps[2])
+			duplicate := cloneStep(plan.Steps[3])
 			duplicate.ID = "inventory-again"
 			plan.Steps = append(plan.Steps, duplicate)
-			plan.Steps[3].DependsOn = append(plan.Steps[3].DependsOn, duplicate.ID)
+			plan.Steps[4].DependsOn = append(plan.Steps[4].DependsOn, duplicate.ID)
 		}},
 		{name: "multiple terminals", code: "terminal_count", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps = append(plan.Steps, agent.Step{ID: "shipment", Tool: "get_shipment", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "shipment.exists"})
+			plan.Steps = append(plan.Steps, agent.Step{ID: "shipment-other", Tool: "get_shipment", Arguments: json.RawMessage(`{"order_id":"AG-1043"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "shipment.exists"})
 		}},
 		{name: "unknown tool", code: "unknown_tool", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps[2].Tool = "delete_order"
+			plan.Steps[3].Tool = "delete_order"
 		}},
 		{name: "invalid tool arguments", code: "invalid_arguments", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps[3].Arguments = json.RawMessage(`{"order_id":"AG-1042","sku":"SKU-RED-42"}`)
+			plan.Steps[4].Arguments = json.RawMessage(`{"order_id":"AG-1042","sku":"SKU-RED-42"}`)
 		}},
 		{name: "risk mismatch", code: "risk_mismatch", mutate: func(plan *agent.ActionPlan) {
-			plan.Steps[3].Risk = toolkit.Read
+			plan.Steps[4].Risk = toolkit.Read
 		}},
 	}
 
@@ -177,7 +190,7 @@ func TestVerifierRejectsInvalidStructureAndContracts(t *testing.T) {
 
 func TestVerifierBindsReplacementInventorySKU(t *testing.T) {
 	plan, verificationContext, reader := validReplacementFixture()
-	plan.Steps[2].Arguments = json.RawMessage(`{"sku":"SKU-BLUE-99"}`)
+	plan.Steps[3].Arguments = json.RawMessage(`{"sku":"SKU-BLUE-99"}`)
 
 	_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
 	requireErrorCode(t, result, "sku_mismatch")
@@ -377,7 +390,7 @@ func TestValidateArgumentsNormalizesExactJSONIntegers(t *testing.T) {
 
 func TestVerifierReturnsStableRepairErrorForMissingScope(t *testing.T) {
 	plan, verificationContext, reader := validReplacementFixture()
-	verificationContext.Scopes = []string{"order:read", "eligibility:read", "inventory:read"}
+	verificationContext.Scopes = []string{"order:read", "shipment:read", "eligibility:read", "inventory:read"}
 
 	_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
 	want := Result{Errors: []Error{{
@@ -484,7 +497,7 @@ func TestVerifierRejectsCouponAboveTypedEvidenceCap(t *testing.T) {
 func TestVerifierRequiresWritePostconditionAndHighRiskApproval(t *testing.T) {
 	t.Run("write postcondition", func(t *testing.T) {
 		plan, verificationContext, reader := validReplacementFixture()
-		plan.Steps[3].SuccessCondition = ""
+		plan.Steps[4].SuccessCondition = ""
 		_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
 		requireErrorCode(t, result, "invalid_postcondition")
 	})
@@ -506,14 +519,15 @@ func validReplacementFixture() (agent.ActionPlan, Context, *fakeFactReader) {
 		PolicyRefs: []string{replacementCitationID},
 		Steps: []agent.Step{
 			{ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "order.exists"},
+			{ID: "shipment", Tool: "get_shipment", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{"order"}, Risk: toolkit.Read, SuccessCondition: "shipment.exists"},
 			{ID: "eligibility", Tool: "check_eligibility", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), DependsOn: []string{"order"}, Risk: toolkit.Read, SuccessCondition: "eligibility.eligible"},
 			{ID: "inventory", Tool: "check_inventory", Arguments: json.RawMessage(`{"sku":"SKU-RED-42"}`), DependsOn: []string{}, Risk: toolkit.Read, SuccessCondition: "inventory.available"},
-			{ID: "replace", Tool: "create_replacement", Arguments: json.RawMessage(`{"order_id":"AG-1042","sku":"SKU-RED-42","reason":"damaged"}`), DependsOn: []string{"eligibility", "inventory"}, Risk: toolkit.Write, SuccessCondition: "replacement.created"},
+			{ID: "replace", Tool: "create_replacement", Arguments: json.RawMessage(`{"order_id":"AG-1042","sku":"SKU-RED-42","reason":"damaged"}`), DependsOn: []string{"shipment", "eligibility", "inventory"}, Risk: toolkit.Write, SuccessCondition: "replacement.created"},
 		},
 	}
 	verificationContext := Context{
 		UserID: "user-018", ResolvedOrderID: "AG-1042",
-		Scopes: []string{"order:read", "eligibility:read", "inventory:read", "replacement:write"},
+		Scopes: []string{"order:read", "shipment:read", "eligibility:read", "inventory:read", "replacement:write"},
 		Now:    verifierTestNow,
 		Evidence: []policy.Evidence{
 			baseEvidence("damaged_goods", "v3", "Replacement eligibility", toolkit.Write),
@@ -527,7 +541,7 @@ func validReplacementFixture() (agent.ActionPlan, Context, *fakeFactReader) {
 
 func duplicateReplacementFixture(arguments json.RawMessage) (agent.ActionPlan, Context, *fakeFactReader) {
 	plan, verificationContext, reader := validReplacementFixture()
-	duplicate := cloneStep(plan.Steps[3])
+	duplicate := cloneStep(plan.Steps[4])
 	duplicate.ID = "replace-again"
 	duplicate.Arguments = arguments
 	plan.Steps = append(plan.Steps, duplicate)

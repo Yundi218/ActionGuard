@@ -30,8 +30,8 @@ func TestFixturePlannerSupportsOnlyDocumentedSyntheticExamples(t *testing.T) {
 		wantApproval bool
 	}{
 		{name: "order lookup", message: FixtureOrderLookupMessage, wantTools: []string{"get_order"}, wantRefs: []string{}},
-		{name: "damaged item replacement", message: FixtureReplacementMessage, evidence: evidence, wantTools: []string{"get_order", "check_eligibility", "check_inventory", "create_replacement"}, wantRefs: []string{evidence[0].CitationID}},
-		{name: "replacement plus coupon waits for runtime", message: FixtureReplacementCouponMessage, evidence: evidence, wantTools: []string{"get_order", "check_eligibility", "check_inventory", "create_replacement", "issue_coupon"}, wantRefs: []string{evidence[0].CitationID, evidence[1].CitationID}, wantApproval: true},
+		{name: "damaged item replacement", message: FixtureReplacementMessage, evidence: evidence, wantTools: []string{"get_order", "get_shipment", "check_eligibility", "check_inventory", "create_replacement"}, wantRefs: []string{evidence[0].CitationID}},
+		{name: "replacement plus coupon waits for runtime", message: FixtureReplacementCouponMessage, evidence: evidence, wantTools: []string{"get_order", "get_shipment", "check_eligibility", "check_inventory", "create_replacement", "issue_coupon"}, wantRefs: []string{evidence[0].CitationID, evidence[1].CitationID}, wantApproval: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -59,6 +59,24 @@ func TestFixturePlannerSupportsOnlyDocumentedSyntheticExamples(t *testing.T) {
 				t.Fatalf("fixture plan violates strict ActionPlan contract: %v", err)
 			}
 		})
+	}
+}
+
+func TestFixturePlannerReplacementRequiresCanonicalShipmentContract(t *testing.T) {
+	contracts := toolkit.Registry()
+	withoutShipment := contracts[:0]
+	for _, contract := range contracts {
+		if contract.Name != "get_shipment" {
+			withoutShipment = append(withoutShipment, contract)
+		}
+	}
+	_, err := NewFixturePlanner().Plan(context.Background(), PlanRequest{
+		UserMessage:   FixtureReplacementMessage,
+		Evidence:      []policy.Evidence{{CitationID: "damaged", PolicyID: "damaged_goods"}},
+		ToolContracts: withoutShipment,
+	})
+	if !errors.Is(err, ErrUnsupportedFixture) {
+		t.Fatalf("error = %v, want ErrUnsupportedFixture", err)
 	}
 }
 

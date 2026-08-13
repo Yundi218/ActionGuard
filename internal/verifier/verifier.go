@@ -770,14 +770,14 @@ var prerequisiteRules = map[string]graphRules{
 		"get_order": {}, "check_eligibility": {"get_order"}, "create_return": {"check_eligibility"},
 	}, map[string][]string{"check_eligibility": {"get_order"}, "create_return": {"check_eligibility"}}),
 	"create_replacement": graph("create_replacement", map[string][]string{
-		"get_order": {}, "check_eligibility": {"get_order"}, "check_inventory": {}, "create_replacement": {"check_eligibility", "check_inventory"},
-	}, map[string][]string{"check_eligibility": {"get_order"}, "create_replacement": {"check_eligibility", "check_inventory"}}),
+		"get_order": {}, "get_shipment": {"get_order"}, "check_eligibility": {"get_order"}, "check_inventory": {}, "create_replacement": {"get_shipment", "check_eligibility", "check_inventory"},
+	}, map[string][]string{"get_shipment": {"get_order"}, "check_eligibility": {"get_order"}, "create_replacement": {"get_shipment", "check_eligibility", "check_inventory"}}),
 	"issue_refund": graph("issue_refund", map[string][]string{
 		"get_order": {}, "issue_refund": {"get_order"},
 	}, map[string][]string{"issue_refund": {"get_order"}}),
 	"issue_coupon": graph("issue_coupon", map[string][]string{
-		"get_order": {}, "check_eligibility": {"get_order"}, "check_inventory": {}, "create_replacement": {"check_eligibility", "check_inventory"}, "issue_coupon": {"create_replacement"},
-	}, map[string][]string{"check_eligibility": {"get_order"}, "create_replacement": {"check_eligibility", "check_inventory"}}),
+		"get_order": {}, "get_shipment": {"get_order"}, "check_eligibility": {"get_order"}, "check_inventory": {}, "create_replacement": {"get_shipment", "check_eligibility", "check_inventory"}, "issue_coupon": {"create_replacement"},
+	}, map[string][]string{"get_shipment": {"get_order"}, "check_eligibility": {"get_order"}, "create_replacement": {"get_shipment", "check_eligibility", "check_inventory"}}),
 }
 
 func graph(terminal string, allowed, required map[string][]string) graphRules {

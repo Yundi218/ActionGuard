@@ -63,16 +63,7 @@ func (s *Service) CreateReturn(ctx context.Context, userID, orderID, reason, ide
 	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
 		return result, err
 	}
-
-	evaluatedAt := s.now()
-	order, err := s.ownedOrder(ctx, userID, orderID)
-	if err != nil {
-		return s.replayOrError(ctx, identity, err)
-	}
-	if !eligibilityForOrder(order, evaluatedAt).Eligible {
-		return s.replayOrError(ctx, identity, ErrIneligible)
-	}
-	return s.store.CreateReturn(ctx, identity, orderID, reason, evaluatedAt)
+	return s.store.CreateReturn(ctx, identity, orderID, reason, s.now())
 }
 
 func (s *Service) CreateReplacement(ctx context.Context, userID, orderID, sku, reason, idempotencyKey string) (WriteResult, error) {
@@ -83,23 +74,7 @@ func (s *Service) CreateReplacement(ctx context.Context, userID, orderID, sku, r
 	if result, replayed, err := s.store.ReplayWrite(ctx, identity); err != nil || replayed {
 		return result, err
 	}
-
-	evaluatedAt := s.now()
-	order, err := s.ownedOrder(ctx, userID, orderID)
-	if err != nil {
-		return s.replayOrError(ctx, identity, err)
-	}
-	if !eligibilityForOrder(order, evaluatedAt).Eligible {
-		return s.replayOrError(ctx, identity, ErrIneligible)
-	}
-	inventory, err := s.CheckInventory(ctx, sku)
-	if err != nil {
-		return s.replayOrError(ctx, identity, err)
-	}
-	if inventory.Available <= 0 {
-		return s.replayOrError(ctx, identity, ErrInventoryEmpty)
-	}
-	return s.store.CreateReplacement(ctx, identity, orderID, sku, reason, evaluatedAt)
+	return s.store.CreateReplacement(ctx, identity, orderID, sku, reason, s.now())
 }
 
 func (s *Service) IssueRefund(ctx context.Context, userID, orderID string, amountCents int64, idempotencyKey string) (WriteResult, error) {

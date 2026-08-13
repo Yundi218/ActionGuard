@@ -121,6 +121,9 @@ func (s *PostgresStore) CreateReturn(ctx context.Context, identity IdempotencyId
 		if err != nil {
 			return WriteResult{}, err
 		}
+		if result, found, err := activeReturnResult(ctx, tx, orderID, reason); err != nil || found {
+			return result, err
+		}
 		if !eligibilityForOrder(order, evaluatedAt).Eligible {
 			return WriteResult{}, ErrIneligible
 		}
@@ -143,6 +146,9 @@ func (s *PostgresStore) CreateReplacement(ctx context.Context, identity Idempote
 		order, err := lockOwnedOrder(ctx, tx, identity.PrincipalID, orderID)
 		if err != nil {
 			return WriteResult{}, err
+		}
+		if result, found, err := activeReplacementResult(ctx, tx, orderID, sku, reason); err != nil || found {
+			return result, err
 		}
 		if !eligibilityForOrder(order, evaluatedAt).Eligible {
 			return WriteResult{}, ErrIneligible
@@ -336,6 +342,48 @@ func lockOwnedOrder(ctx context.Context, tx pgx.Tx, principalID, orderID string)
 	return order, nil
 }
 
+func activeReturnResult(ctx context.Context, tx pgx.Tx, orderID, reason string) (WriteResult, bool, error) {
+	var id, activeReason string
+	err := tx.QueryRow(ctx, `
+		select id::text, reason
+		from returns
+		where order_id = $1 and status in ('created', 'received')
+		order by created_at, id
+		limit 1
+	`, orderID).Scan(&id, &activeReason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WriteResult{}, false, nil
+	}
+	if err != nil {
+		return WriteResult{}, false, err
+	}
+	if activeReason != reason {
+		return WriteResult{}, false, ErrIdempotencyConflict
+	}
+	return replayedWriteResult("return", id), true, nil
+}
+
+func activeReplacementResult(ctx context.Context, tx pgx.Tx, orderID, sku, reason string) (WriteResult, bool, error) {
+	var id, activeSKU, activeReason string
+	err := tx.QueryRow(ctx, `
+		select id::text, sku, reason
+		from replacements
+		where order_id = $1 and status in ('created', 'shipped')
+		order by created_at, id
+		limit 1
+	`, orderID).Scan(&id, &activeSKU, &activeReason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return WriteResult{}, false, nil
+	}
+	if err != nil {
+		return WriteResult{}, false, err
+	}
+	if activeSKU != sku || activeReason != reason {
+		return WriteResult{}, false, ErrIdempotencyConflict
+	}
+	return replayedWriteResult("replacement", id), true, nil
+}
+
 func validateIdentity(identity IdempotencyIdentity) error {
 	switch identity.Operation {
 	case createReturnOperation, createReplacementOperation, issueRefundOperation, issueCouponOperation:
@@ -407,4 +455,10 @@ func createdResult(resourceType, resourceID string) WriteResult {
 		ResourceID:   resourceID,
 		Status:       "created",
 	}
+}
+
+func replayedWriteResult(resourceType, resourceID string) WriteResult {
+	result := createdResult(resourceType, resourceID)
+	result.Replayed = true
+	return result
 }
