@@ -32,9 +32,10 @@ type MCPConfig struct {
 }
 
 type MCPExecutor struct {
-	session *mcp.ClientSession
-	mu      sync.RWMutex
-	closed  bool
+	session  *mcp.ClientSession
+	mu       sync.RWMutex
+	closed   bool
+	closeErr error
 }
 
 func NewMCPExecutor(ctx context.Context, config MCPConfig) (*MCPExecutor, error) {
@@ -92,20 +93,18 @@ func (executor *MCPExecutor) Close() error {
 		return nil
 	}
 	executor.mu.Lock()
+	defer executor.mu.Unlock()
 	if executor.closed {
-		executor.mu.Unlock()
-		return nil
+		return executor.closeErr
 	}
 	executor.closed = true
-	session := executor.session
-	executor.mu.Unlock()
-	if session == nil {
+	if executor.session == nil {
 		return nil
 	}
-	if err := session.Close(); err != nil {
-		return ErrMCPTransport
+	if err := executor.session.Close(); err != nil {
+		executor.closeErr = ErrMCPTransport
 	}
-	return nil
+	return executor.closeErr
 }
 
 type preflightPlan struct {
@@ -153,10 +152,18 @@ func (executor *MCPExecutor) Execute(ctx context.Context, request ExecutionReque
 		if contract.Risk == toolkit.Write {
 			metadata.IdempotencyKey = deriveIdempotencyKey(request.RunID, step.ID, step.Tool)
 		}
-		callContext := toolkit.WithCallContext(ctx, metadata)
+		callContext, responseState := withResponseLimitState(toolkit.WithCallContext(ctx, metadata))
 		toolResult, callErr := executor.session.CallTool(callContext, &mcp.CallToolParams{
 			Name: step.Tool, Arguments: append(json.RawMessage(nil), step.Arguments...),
 		})
+		if contextErr := ctx.Err(); contextErr != nil {
+			result.Status = StatusFailed
+			return cloneExecutionResult(result), contextErr
+		}
+		if responseState.tooLarge.Load() {
+			result.Status = StatusFailed
+			return cloneExecutionResult(result), ErrMCPResponseTooLarge
+		}
 		if callErr != nil {
 			result.Status = StatusFailed
 			return cloneExecutionResult(result), sanitizeTransportError(ctx.Err(), callErr)

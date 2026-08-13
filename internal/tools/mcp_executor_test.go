@@ -421,6 +421,135 @@ func TestResponseLimitRejectsDeclaredAndStreamedBodies(t *testing.T) {
 	}
 }
 
+func TestExecutorPreservesOversizedToolResponseClassification(t *testing.T) {
+	tests := []struct {
+		name string
+		mode oversizedResponseMode
+	}{
+		{name: "declared", mode: oversizedDeclared},
+		{name: "streamed", mode: oversizedStreamed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			recorder := &callRecorder{}
+			transport := &oversizedToolResponseTransport{next: http.DefaultTransport, mode: test.mode}
+			executor := newTestExecutorWithClientOptions(t, recorder, &http.Client{Transport: transport}, false)
+			plan := forgePlan(agent.ActionPlan{Steps: []agent.Step{{
+				ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), Risk: toolkit.Read,
+			}}}, "user_018", []string{"order:read"})
+
+			result, err := executor.Execute(context.Background(), ExecutionRequest{RunID: "run-oversized-" + test.name, Plan: plan})
+			if !errors.Is(err, ErrMCPResponseTooLarge) || result.Status != StatusFailed {
+				t.Fatalf("Execute() = %#v, %v; want failed/ErrMCPResponseTooLarge", result, err)
+			}
+			_ = executor.Close()
+		})
+	}
+}
+
+func TestExecutorCancellationTakesPriorityOverOversizedResponse(t *testing.T) {
+	recorder := &callRecorder{}
+	transport := &oversizedToolResponseTransport{next: http.DefaultTransport, mode: oversizedStreamed, cancel: true}
+	executor := newTestExecutorWithClientOptions(t, recorder, &http.Client{Transport: transport}, false)
+	plan := forgePlan(agent.ActionPlan{Steps: []agent.Step{{
+		ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), Risk: toolkit.Read,
+	}}}, "user_018", []string{"order:read"})
+	ctx, cancel := context.WithCancel(context.Background())
+	transport.cancelCall = cancel
+
+	result, err := executor.Execute(ctx, ExecutionRequest{RunID: "run-cancel-oversized", Plan: plan})
+	if !errors.Is(err, context.Canceled) || result.Status != StatusFailed {
+		t.Fatalf("Execute() = %#v, %v; want failed/context.Canceled", result, err)
+	}
+	_ = executor.Close()
+}
+
+func TestExecutorCloseClosesDiscardedDeleteResponseBodyAndPreservesStatus(t *testing.T) {
+	recorder := &callRecorder{}
+	tracking := &trackingDeleteTransport{next: http.DefaultTransport, status: http.StatusTeapot, closed: make(chan struct{})}
+	executor := newTestExecutorWithClientOptions(t, recorder, &http.Client{Transport: tracking}, false)
+
+	if err := executor.Close(); err != nil {
+		t.Fatalf("Close() error = %v, want nil for HTTP status response", err)
+	}
+	select {
+	case <-tracking.closed:
+	default:
+		t.Fatal("Close() returned without closing the DELETE response body")
+	}
+}
+
+func TestConcurrentCloseWaitsForSharedSuccessfulShutdown(t *testing.T) {
+	recorder := &callRecorder{}
+	blocking := newBlockingDeleteTransport(http.DefaultTransport, nil)
+	executor := newTestExecutorWithClientOptions(t, recorder, &http.Client{Transport: blocking}, false)
+	plan := forgePlan(agent.ActionPlan{Steps: []agent.Step{{
+		ID: "order", Tool: "get_order", Arguments: json.RawMessage(`{"order_id":"AG-1042"}`), Risk: toolkit.Read,
+	}}}, "user_018", []string{"order:read"})
+
+	first := make(chan error, 1)
+	go func() { first <- executor.Close() }()
+	<-blocking.entered
+	second := make(chan error, 1)
+	go func() { second <- executor.Close() }()
+	executeResult := make(chan error, 1)
+	go func() {
+		_, err := executor.Execute(context.Background(), ExecutionRequest{RunID: "run-during-close", Plan: plan})
+		executeResult <- err
+	}()
+
+	assertNoResult(t, first, "first Close")
+	assertNoResult(t, second, "second Close")
+	assertNoResult(t, executeResult, "Execute during Close")
+	close(blocking.release)
+	if err := <-first; err != nil {
+		t.Fatalf("first Close() error = %v", err)
+	}
+	if err := <-second; err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+	if err := <-executeResult; !errors.Is(err, ErrExecutorClosed) {
+		t.Fatalf("Execute() error = %v, want ErrExecutorClosed", err)
+	}
+	if err := executor.Close(); err != nil {
+		t.Fatalf("cached Close() error = %v", err)
+	}
+	if _, err := executor.Execute(context.Background(), ExecutionRequest{RunID: "run-after-close", Plan: plan}); !errors.Is(err, ErrExecutorClosed) {
+		t.Fatalf("Execute() after Close error = %v, want ErrExecutorClosed", err)
+	}
+	if calls := recorder.snapshot(); len(calls) != 0 {
+		t.Fatalf("tool calls during close = %d, want zero", len(calls))
+	}
+}
+
+func TestConcurrentCloseWaitsForAndCachesSanitizedError(t *testing.T) {
+	recorder := &callRecorder{}
+	rawErr := errors.New("delete leaked gateway secret")
+	blocking := newBlockingDeleteTransport(http.DefaultTransport, rawErr)
+	executor := newTestExecutorWithClientOptions(t, recorder, &http.Client{Transport: blocking}, false)
+
+	first := make(chan error, 1)
+	go func() { first <- executor.Close() }()
+	<-blocking.entered
+	second := make(chan error, 1)
+	go func() { second <- executor.Close() }()
+	assertNoResult(t, first, "first Close")
+	assertNoResult(t, second, "second Close")
+	close(blocking.release)
+
+	firstErr := <-first
+	secondErr := <-second
+	thirdErr := executor.Close()
+	for index, err := range []error{firstErr, secondErr, thirdErr} {
+		if err != ErrMCPTransport {
+			t.Fatalf("Close result %d = %v, want cached ErrMCPTransport", index, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("Close result %d leaked raw transport error: %v", index, err)
+		}
+	}
+}
+
 func TestMetadataTransportStripsSpoofedHeadersBeforeSettingTrustedValues(t *testing.T) {
 	var observed http.Header
 	transport := metadataTransport{gatewayToken: testGatewayToken, next: roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -463,6 +592,11 @@ func newTestExecutor(t *testing.T, recorder *callRecorder) *MCPExecutor {
 
 func newTestExecutorWithClient(t *testing.T, recorder *callRecorder, client *http.Client) *MCPExecutor {
 	t.Helper()
+	return newTestExecutorWithClientOptions(t, recorder, client, true)
+}
+
+func newTestExecutorWithClientOptions(t *testing.T, recorder *callRecorder, client *http.Client, cleanupExecutor bool) *MCPExecutor {
+	t.Helper()
 	server := mcp.NewServer(&mcp.Implementation{Name: "test-tools", Version: "v1"}, nil)
 	for _, contract := range toolkit.Registry() {
 		server.AddTool(&mcp.Tool{Name: contract.Name, InputSchema: contract.InputSchema}, recorder.handler)
@@ -497,11 +631,13 @@ func newTestExecutorWithClient(t *testing.T, recorder *callRecorder, client *htt
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		if err := executor.Close(); err != nil {
-			t.Errorf("close executor: %v", err)
-		}
-	})
+	if cleanupExecutor {
+		t.Cleanup(func() {
+			if err := executor.Close(); err != nil {
+				t.Errorf("close executor: %v", err)
+			}
+		})
+	}
 	return executor
 }
 
@@ -538,4 +674,108 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (function roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return function(request)
+}
+
+type oversizedResponseMode uint8
+
+const (
+	oversizedDeclared oversizedResponseMode = iota
+	oversizedStreamed
+)
+
+type oversizedToolResponseTransport struct {
+	next       http.RoundTripper
+	mode       oversizedResponseMode
+	cancel     bool
+	cancelCall context.CancelFunc
+}
+
+func (transport *oversizedToolResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	response, err := transport.next.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := toolkit.FromContext(request.Context()); err != nil || request.Method != http.MethodPost {
+		return response, nil
+	}
+	if transport.cancel && transport.cancelCall != nil {
+		transport.cancelCall()
+	}
+	switch transport.mode {
+	case oversizedDeclared:
+		response.ContentLength = maxMCPResponseBytes + 1
+		response.Header.Set("Content-Length", "1048577")
+	case oversizedStreamed:
+		_ = response.Body.Close()
+		response.Body = io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(maxMCPResponseBytes+1))))
+		response.ContentLength = -1
+		response.Header.Del("Content-Length")
+	}
+	return response, nil
+}
+
+type trackingDeleteTransport struct {
+	next   http.RoundTripper
+	status int
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (transport *trackingDeleteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method != http.MethodDelete {
+		return transport.next.RoundTrip(request)
+	}
+	body := &trackingBody{closed: transport.closed, once: &transport.once}
+	return &http.Response{
+		StatusCode: transport.status,
+		Status:     http.StatusText(transport.status),
+		Header:     make(http.Header),
+		Body:       body,
+		Request:    request,
+	}, nil
+}
+
+type trackingBody struct {
+	closed chan struct{}
+	once   *sync.Once
+}
+
+func (*trackingBody) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (body *trackingBody) Close() error {
+	body.once.Do(func() { close(body.closed) })
+	return nil
+}
+
+type blockingDeleteTransport struct {
+	next    http.RoundTripper
+	err     error
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newBlockingDeleteTransport(next http.RoundTripper, err error) *blockingDeleteTransport {
+	return &blockingDeleteTransport{next: next, err: err, entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (transport *blockingDeleteTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method != http.MethodDelete {
+		return transport.next.RoundTrip(request)
+	}
+	transport.once.Do(func() { close(transport.entered) })
+	<-transport.release
+	if transport.err != nil {
+		return nil, transport.err
+	}
+	return transport.next.RoundTrip(request)
+}
+
+func assertNoResult(t *testing.T, result <-chan error, operation string) {
+	t.Helper()
+	select {
+	case err := <-result:
+		t.Fatalf("%s returned early with %v", operation, err)
+	case <-time.After(50 * time.Millisecond):
+	}
 }

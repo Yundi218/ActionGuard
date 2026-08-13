@@ -1,10 +1,12 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Yundi218/ActionGuard/internal/toolkit"
 )
@@ -49,8 +51,30 @@ type responseLimitTransport struct {
 	next http.RoundTripper
 }
 
+type responseLimitState struct {
+	tooLarge atomic.Bool
+}
+
+type responseLimitStateKey struct{}
+
+func withResponseLimitState(ctx context.Context) (context.Context, *responseLimitState) {
+	state := &responseLimitState{}
+	return context.WithValue(ctx, responseLimitStateKey{}, state), state
+}
+
+func responseLimitStateFromContext(ctx context.Context) *responseLimitState {
+	state, _ := ctx.Value(responseLimitStateKey{}).(*responseLimitState)
+	return state
+}
+
 func (transport responseLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
 	response, err := transport.next.RoundTrip(request)
+	if request.Method == http.MethodDelete && response != nil && response.Body != nil {
+		_ = response.Body.Close()
+		response.Body = http.NoBody
+		response.ContentLength = 0
+		response.Header.Del("Content-Length")
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -60,18 +84,32 @@ func (transport responseLimitTransport) RoundTrip(request *http.Request) (*http.
 		}
 		return nil, ErrMCPTransport
 	}
+	if request.Method == http.MethodDelete {
+		return response, nil
+	}
 	if response.ContentLength > maxMCPResponseBytes {
+		markResponseTooLarge(request.Context())
 		_ = response.Body.Close()
 		return nil, ErrMCPResponseTooLarge
 	}
-	response.Body = &limitedResponseBody{body: response.Body, remaining: maxMCPResponseBytes}
+	response.Body = &limitedResponseBody{
+		body: response.Body, remaining: maxMCPResponseBytes,
+		state: responseLimitStateFromContext(request.Context()),
+	}
 	return response, nil
+}
+
+func markResponseTooLarge(ctx context.Context) {
+	if state := responseLimitStateFromContext(ctx); state != nil {
+		state.tooLarge.Store(true)
+	}
 }
 
 type limitedResponseBody struct {
 	body      io.ReadCloser
 	remaining int64
 	exceeded  bool
+	state     *responseLimitState
 }
 
 func (body *limitedResponseBody) Read(buffer []byte) (int, error) {
@@ -86,6 +124,9 @@ func (body *limitedResponseBody) Read(buffer []byte) (int, error) {
 		n, err := body.body.Read(probe[:])
 		if n > 0 {
 			body.exceeded = true
+			if body.state != nil {
+				body.state.tooLarge.Store(true)
+			}
 			return 0, ErrMCPResponseTooLarge
 		}
 		return 0, err
