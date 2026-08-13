@@ -7,11 +7,15 @@ import (
 	"net/http"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/Yundi218/ActionGuard/internal/toolkit"
 )
 
-const maxMCPResponseBytes int64 = 1 << 20
+const (
+	maxMCPResponseBytes int64 = 1 << 20
+	mcpCleanupTimeout         = 250 * time.Millisecond
+)
 
 var trustedRequestHeaders = []string{
 	"Authorization",
@@ -52,7 +56,9 @@ type responseLimitTransport struct {
 }
 
 type responseLimitState struct {
-	tooLarge atomic.Bool
+	tooLarge       atomic.Bool
+	initializing   atomic.Bool
+	connectContext context.Context
 }
 
 type responseLimitStateKey struct{}
@@ -62,12 +68,23 @@ func withResponseLimitState(ctx context.Context) (context.Context, *responseLimi
 	return context.WithValue(ctx, responseLimitStateKey{}, state), state
 }
 
+func withConnectResponseLimitState(ctx context.Context) (context.Context, *responseLimitState) {
+	state := &responseLimitState{connectContext: ctx}
+	state.initializing.Store(true)
+	return context.WithValue(ctx, responseLimitStateKey{}, state), state
+}
+
 func responseLimitStateFromContext(ctx context.Context) *responseLimitState {
 	state, _ := ctx.Value(responseLimitStateKey{}).(*responseLimitState)
 	return state
 }
 
 func (transport responseLimitTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method == http.MethodDelete {
+		boundedRequest, cancel := boundedCleanupRequest(request)
+		defer cancel()
+		request = boundedRequest
+	}
 	response, err := transport.next.RoundTrip(request)
 	if request.Method == http.MethodDelete && response != nil && response.Body != nil {
 		_ = response.Body.Close()
@@ -97,6 +114,15 @@ func (transport responseLimitTransport) RoundTrip(request *http.Request) (*http.
 		state: responseLimitStateFromContext(request.Context()),
 	}
 	return response, nil
+}
+
+func boundedCleanupRequest(request *http.Request) (*http.Request, context.CancelFunc) {
+	base := context.Background()
+	if state := responseLimitStateFromContext(request.Context()); state != nil && state.initializing.Load() && state.connectContext != nil {
+		base = state.connectContext
+	}
+	ctx, cancel := context.WithTimeout(base, mcpCleanupTimeout)
+	return request.Clone(ctx), cancel
 }
 
 func markResponseTooLarge(ctx context.Context) {

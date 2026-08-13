@@ -60,13 +60,14 @@ func NewMCPExecutor(ctx context.Context, config MCPConfig) (*MCPExecutor, error)
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return ErrMCPRedirect }
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "actionguard-executor", Version: "v0.2.0"}, nil)
-	connectContext, responseState := withResponseLimitState(valueFreeContext{Context: ctx})
+	connectContext, responseState := withConnectResponseLimitState(valueFreeContext{Context: ctx})
 	session, err := client.Connect(connectContext, &mcp.StreamableClientTransport{
 		Endpoint: endpoint, HTTPClient: &clientCopy, MaxRetries: -1, DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
 		return nil, classifyTransportError(ctx, responseState, err)
 	}
+	responseState.initializing.Store(false)
 	return &MCPExecutor{session: session}, nil
 }
 

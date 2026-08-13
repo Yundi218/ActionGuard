@@ -510,6 +510,81 @@ func TestNewMCPExecutorCancellationPrecedesOversizedInitialize(t *testing.T) {
 	}
 }
 
+func TestNewMCPExecutorBoundsFailedInitializeCleanupWithCallerDeadline(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "bounded-initialize-cleanup", Version: "v1"}, nil)
+	handler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+	)
+	testServer := httptest.NewServer(handler)
+	t.Cleanup(testServer.Close)
+	transport := newCleanupDeadlineTransport(http.DefaultTransport, true, oversizedStreamed)
+	deadlineContext, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	callerContext := toolkit.WithCallContext(deadlineContext, toolkit.CallContext{
+		RunID: "caller-run", StepID: "caller-step", UserID: "caller-user",
+		Scopes: []string{"admin"}, IdempotencyKey: "caller-key",
+	})
+
+	started := time.Now()
+	executor, err := NewMCPExecutor(callerContext, MCPConfig{
+		Endpoint: testServer.URL, GatewayToken: testGatewayToken,
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	elapsed := time.Since(started)
+	if executor != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("NewMCPExecutor() = %#v, %v; want nil/context.DeadlineExceeded", executor, err)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("NewMCPExecutor() returned after %v, want caller deadline to bound cleanup", elapsed)
+	}
+	transport.requireFinished(t)
+	transport.requireNoTrustedHeaders(t)
+	transport.requireInitializeBodyClosed(t)
+}
+
+func TestCanceledConstructorContextDoesNotAbortBoundedNormalClose(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "bounded-normal-close", Version: "v1"}, nil)
+	handler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+	)
+	testServer := httptest.NewServer(handler)
+	t.Cleanup(testServer.Close)
+	transport := newCleanupDeadlineTransport(http.DefaultTransport, false, oversizedDeclared)
+	constructorContext, cancelConstructor := context.WithCancel(context.Background())
+	callerContext := toolkit.WithCallContext(constructorContext, toolkit.CallContext{
+		RunID: "caller-run", StepID: "caller-step", UserID: "caller-user",
+		Scopes: []string{"admin"}, IdempotencyKey: "caller-key",
+	})
+	executor, err := NewMCPExecutor(callerContext, MCPConfig{
+		Endpoint: testServer.URL, GatewayToken: testGatewayToken,
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelConstructor()
+
+	started := time.Now()
+	err = executor.Close()
+	elapsed := time.Since(started)
+	if !errors.Is(err, ErrMCPTransport) {
+		t.Fatalf("Close() error = %v, want ErrMCPTransport after cleanup timeout", err)
+	}
+	if elapsed < 25*time.Millisecond {
+		t.Fatalf("Close() returned after %v; canceled constructor context aborted normal cleanup", elapsed)
+	}
+	if elapsed >= 500*time.Millisecond {
+		t.Fatalf("Close() returned after %v, want fixed cleanup timeout", elapsed)
+	}
+	transport.requireFinished(t)
+	if initialErr := transport.deleteInitialContextError(); initialErr != nil {
+		t.Fatalf("normal DELETE began with canceled context: %v", initialErr)
+	}
+	transport.requireNoTrustedHeaders(t)
+}
+
 func TestExecutorCancellationTakesPriorityOverOversizedResponse(t *testing.T) {
 	recorder := &callRecorder{}
 	transport := &oversizedToolResponseTransport{next: http.DefaultTransport, mode: oversizedStreamed, cancel: true}
@@ -759,6 +834,142 @@ type oversizedInitializeTransport struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex
 	headers http.Header
+}
+
+const cleanupTransportSafetyTimeout = 750 * time.Millisecond
+
+type cleanupDeadlineTransport struct {
+	next                 http.RoundTripper
+	oversizedInitialize  bool
+	mode                 oversizedResponseMode
+	deleteEntered        chan struct{}
+	deleteExited         chan struct{}
+	initializeBodyClosed chan struct{}
+	mu                   sync.Mutex
+	initializeHeaders    http.Header
+	deleteHeaders        http.Header
+	deleteInitialErr     error
+	enterOnce            sync.Once
+	exitOnce             sync.Once
+	bodyCloseOnce        sync.Once
+}
+
+func newCleanupDeadlineTransport(next http.RoundTripper, oversizedInitialize bool, mode oversizedResponseMode) *cleanupDeadlineTransport {
+	return &cleanupDeadlineTransport{
+		next: next, oversizedInitialize: oversizedInitialize, mode: mode,
+		deleteEntered: make(chan struct{}), deleteExited: make(chan struct{}),
+		initializeBodyClosed: make(chan struct{}),
+	}
+}
+
+func (transport *cleanupDeadlineTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method == http.MethodDelete {
+		transport.mu.Lock()
+		transport.deleteHeaders = request.Header.Clone()
+		transport.deleteInitialErr = request.Context().Err()
+		transport.mu.Unlock()
+		transport.enterOnce.Do(func() { close(transport.deleteEntered) })
+		defer transport.exitOnce.Do(func() { close(transport.deleteExited) })
+		select {
+		case <-request.Context().Done():
+			return nil, request.Context().Err()
+		case <-time.After(cleanupTransportSafetyTimeout):
+			return nil, errors.New("test cleanup safety timeout")
+		}
+	}
+
+	initialize := false
+	if request.Method == http.MethodPost && request.Body != nil {
+		requestBody, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		request.Body = io.NopCloser(bytes.NewReader(requestBody))
+		initialize = bytes.Contains(requestBody, []byte(`"method":"initialize"`))
+		if initialize {
+			transport.mu.Lock()
+			transport.initializeHeaders = request.Header.Clone()
+			transport.mu.Unlock()
+		}
+	}
+	response, err := transport.next.RoundTrip(request)
+	if err != nil || !transport.oversizedInitialize || !initialize {
+		return response, err
+	}
+	closed := func() { transport.bodyCloseOnce.Do(func() { close(transport.initializeBodyClosed) }) }
+	switch transport.mode {
+	case oversizedDeclared:
+		response.Body = &observedReadCloser{ReadCloser: response.Body, onClose: closed}
+		response.ContentLength = maxMCPResponseBytes + 1
+		response.Header.Set("Content-Length", "1048577")
+	case oversizedStreamed:
+		_ = response.Body.Close()
+		response.Body = &observedReadCloser{
+			ReadCloser: io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(maxMCPResponseBytes+1)))),
+			onClose:    closed,
+		}
+		response.ContentLength = -1
+		response.Header.Del("Content-Length")
+	}
+	return response, nil
+}
+
+func (transport *cleanupDeadlineTransport) requireFinished(t *testing.T) {
+	t.Helper()
+	select {
+	case <-transport.deleteEntered:
+	default:
+		t.Fatal("cleanup DELETE was not issued")
+	}
+	select {
+	case <-transport.deleteExited:
+	default:
+		t.Fatal("cleanup DELETE goroutine did not exit")
+	}
+}
+
+func (transport *cleanupDeadlineTransport) requireNoTrustedHeaders(t *testing.T) {
+	t.Helper()
+	transport.mu.Lock()
+	initializeHeaders := transport.initializeHeaders.Clone()
+	deleteHeaders := transport.deleteHeaders.Clone()
+	transport.mu.Unlock()
+	for phase, headers := range map[string]http.Header{"initialize": initializeHeaders, "DELETE": deleteHeaders} {
+		if got := headers.Get("Authorization"); got != "Bearer "+testGatewayToken {
+			t.Fatalf("%s Authorization = %q", phase, got)
+		}
+		for _, header := range trustedRequestHeaders[2:] {
+			if got := headers.Get(header); got != "" {
+				t.Fatalf("%s leaked trusted header %s=%q", phase, header, got)
+			}
+		}
+	}
+}
+
+func (transport *cleanupDeadlineTransport) requireInitializeBodyClosed(t *testing.T) {
+	t.Helper()
+	select {
+	case <-transport.initializeBodyClosed:
+	default:
+		t.Fatal("oversized initialize response body was not closed")
+	}
+}
+
+func (transport *cleanupDeadlineTransport) deleteInitialContextError() error {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	return transport.deleteInitialErr
+}
+
+type observedReadCloser struct {
+	io.ReadCloser
+	onClose func()
+}
+
+func (body *observedReadCloser) Close() error {
+	err := body.ReadCloser.Close()
+	body.onClose()
+	return err
 }
 
 func (transport *oversizedInitializeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
