@@ -942,7 +942,10 @@ git commit -m "feat: enforce commerce operation invariants"
 
 - [ ] **Step 1: Add the official MCP SDK and write a failing discovery test**
 
-Run: `go get github.com/modelcontextprotocol/go-sdk@v1.7.0`
+Run: `go get github.com/modelcontextprotocol/go-sdk@v1.4.0`
+
+`v1.4.0` is the latest official SDK release whose `go.mod` declares Go 1.24;
+newer releases require Go 1.25.
 
 Create `internal/mcpserver/server_test.go`:
 
@@ -964,6 +967,7 @@ func TestServerListsAllCommerceTools(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer serverSession.Close()
 	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v0.1.0"}, nil)
 	clientSession, err := client.Connect(context.Background(), clientTransport, nil)
 	if err != nil {
