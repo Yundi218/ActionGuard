@@ -3,6 +3,7 @@ package policy
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
@@ -121,6 +122,19 @@ func TestParseMarkdownRejectsInvalidEffectiveInterval(t *testing.T) {
 				t.Fatal("ParseMarkdown accepted effective_from >= effective_to")
 			}
 		})
+	}
+}
+
+func TestParseMarkdownRejectsInvalidUTF8InFrontMatter(t *testing.T) {
+	markdown := policyMarkdown(validFrontMatter, "## Rules\n\nSynthetic rule.\n")
+	policyIDStart := strings.Index(string(markdown), "damaged_goods")
+	if policyIDStart < 0 {
+		t.Fatal("test fixture is missing policy_id value")
+	}
+	markdown[policyIDStart] = 0xff
+
+	if _, err := ParseMarkdown(markdown); !errors.Is(err, ErrInvalidPolicy) {
+		t.Fatalf("ParseMarkdown invalid front-matter UTF-8 error = %v, want ErrInvalidPolicy", err)
 	}
 }
 

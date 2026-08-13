@@ -11,7 +11,7 @@ risk_level: write
 
 ## Replacement eligibility
 
-A delivered electronics order is eligible for replacement when the customer reports that the item arrived damaged and the request is made within 30 days after delivery. The order must belong to the requesting customer and the replacement SKU must match the ordered SKU.
+A delivered electronics order is eligible for replacement when the customer reports that the item arrived damaged and the request is made within 30 days after delivery. The order must belong to the requesting customer.
 
 ## Replacement window
 
@@ -19,4 +19,4 @@ The 30-day window begins at the recorded delivery time. A request at or before t
 
 ## Inventory requirement
 
-A replacement may be created only when inventory is available for the ordered electronics SKU. Creating the replacement reserves one unit atomically.
+The requested target SKU must exist, and the requested target SKU must have available inventory. Creating the replacement reserves one unit of that target SKU atomically.

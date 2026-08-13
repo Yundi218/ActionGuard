@@ -38,6 +38,9 @@ var allowedMetadataKeys = map[string]struct{}{
 }
 
 func ParseMarkdown(markdown []byte) (Document, error) {
+	if !utf8.Valid(markdown) {
+		return Document{}, fmt.Errorf("%w: document is not valid UTF-8", ErrInvalidPolicy)
+	}
 	values, bodyStart, err := parseFrontMatter(markdown)
 	if err != nil {
 		return Document{}, err
@@ -48,9 +51,6 @@ func ParseMarkdown(markdown []byte) (Document, error) {
 	}
 
 	bodyBytes := markdown[bodyStart:]
-	if !utf8.Valid(bodyBytes) {
-		return Document{}, fmt.Errorf("%w: body is not valid UTF-8", ErrInvalidPolicy)
-	}
 	contentHash := sha256.Sum256(markdown)
 	document := Document{
 		Metadata:      metadata,

@@ -2,6 +2,7 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"math"
 	"reflect"
 	"testing"
@@ -50,5 +51,29 @@ func TestDeterministicEmbedderTokenizesLowercaseAlphanumericTerms(t *testing.T) 
 	}
 	if !reflect.DeepEqual(vectors[0], vectors[1]) {
 		t.Fatal("case and punctuation changed token embeddings")
+	}
+}
+
+func TestDeterministicEmbedderRejectsTokenlessText(t *testing.T) {
+	embedder := DeterministicEmbedder{}
+	vectors, err := embedder.Embed(context.Background(), []string{"valid tokens", " -- ... \t\n"})
+	if !errors.Is(err, ErrTokenlessText) {
+		t.Fatalf("tokenless embedding error = %v, want ErrTokenlessText", err)
+	}
+	if vectors != nil {
+		t.Fatalf("vectors = %#v, want nil on tokenless input", vectors)
+	}
+}
+
+func TestDeterministicEmbedderPreservesContextErrorForTokenlessText(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	vectors, err := (DeterministicEmbedder{}).Embed(ctx, []string{"---"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled tokenless embedding error = %v, want context.Canceled", err)
+	}
+	if vectors != nil {
+		t.Fatalf("vectors = %#v, want nil on canceled context", vectors)
 	}
 }

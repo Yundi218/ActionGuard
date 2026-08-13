@@ -4,10 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"errors"
 	"math"
 	"strings"
 	"unicode"
 )
+
+var ErrTokenlessText = errors.New("deterministic embedding text has no alphanumeric tokens")
 
 type DeterministicEmbedder struct{}
 
@@ -17,8 +20,12 @@ func (DeterministicEmbedder) Embed(ctx context.Context, texts []string) ([][]flo
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
+		tokens := tokenize(text)
+		if len(tokens) == 0 {
+			return nil, ErrTokenlessText
+		}
 		vector := make([]float32, EmbeddingDimensions)
-		for _, token := range tokenize(text) {
+		for _, token := range tokens {
 			digest := sha256.Sum256([]byte(token))
 			dimension := binary.BigEndian.Uint64(digest[:8]) % EmbeddingDimensions
 			sign := float32(1)

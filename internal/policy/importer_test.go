@@ -122,8 +122,26 @@ func TestImportRejectsWrongEmbeddingWidthBeforeWriting(t *testing.T) {
 	}
 }
 
+func TestImportMapsTokenlessEmbeddingError(t *testing.T) {
+	store := &recordingPolicyStore{}
+	importer := NewImporter(tokenlessErrorEmbedder{}, store)
+	err := importer.Import(context.Background(), "damaged.md", policyMarkdown(validFrontMatter, "## Rules\n\nText.\n"))
+	if !errors.Is(err, ErrEmbedding) {
+		t.Fatalf("tokenless embedding import error = %v, want ErrEmbedding", err)
+	}
+	if store.called {
+		t.Fatal("store was called after a tokenless embedding error")
+	}
+}
+
 type fixedWidthEmbedder struct {
 	width int
+}
+
+type tokenlessErrorEmbedder struct{}
+
+func (tokenlessErrorEmbedder) Embed(context.Context, []string) ([][]float32, error) {
+	return nil, ErrTokenlessText
 }
 
 func (embedder fixedWidthEmbedder) Embed(_ context.Context, texts []string) ([][]float32, error) {
