@@ -1,4 +1,4 @@
-.PHONY: test vet db-up db-down api
+.PHONY: test vet db-up db-down api mcp
 
 test:
 	go test ./...
@@ -14,3 +14,6 @@ db-down:
 
 api:
 	go run ./cmd/api
+
+mcp:
+	go run ./cmd/commerce-mcp
