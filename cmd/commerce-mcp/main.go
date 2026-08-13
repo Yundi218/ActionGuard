@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"io"
 	"log"
 	"net/http"
 
@@ -11,6 +13,8 @@ import (
 	"github.com/Yundi218/ActionGuard/internal/mcpserver"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+const maxMCPRequestBodyBytes = 1 << 20
 
 func main() {
 	ctx := context.Background()
@@ -42,9 +46,34 @@ func newMCPHandler(server *mcp.Server, token string) http.Handler {
 }
 
 func newMCPMux(token string, transport http.Handler) http.Handler {
-	limitedTransport := http.MaxBytesHandler(transport, 1<<20)
-	handler := mcpserver.TrustedContextMiddleware(token, limitedTransport)
+	limitedTransport := http.MaxBytesHandler(transport, maxMCPRequestBodyBytes)
+	handler := mcpserver.TrustedContextMiddleware(token, limitRequestBody(maxMCPRequestBodyBytes, limitedTransport))
 	mux := http.NewServeMux()
 	mux.Handle("/mcp", handler)
 	return mux
+}
+
+func limitRequestBody(maxBytes int, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		originalBody := r.Body
+		defer originalBody.Close()
+		body := make([]byte, maxBytes+1)
+		n, err := io.ReadFull(originalBody, body)
+		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
+			http.Error(w, "invalid request body", http.StatusBadRequest)
+			return
+		}
+		if n > maxBytes {
+			http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+
+		r.Body = io.NopCloser(bytes.NewReader(body[:n]))
+		next.ServeHTTP(w, r)
+	})
 }

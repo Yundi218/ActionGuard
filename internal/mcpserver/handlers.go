@@ -76,7 +76,7 @@ func TrustedContextMiddleware(token string, next http.Handler) http.Handler {
 
 func getOrderHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetOrderParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params GetOrderParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.Read, "order:read")
+		meta, err := validateCall(ctx, getOrderTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -90,7 +90,7 @@ func getOrderHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetOrderParams, a
 
 func getShipmentHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetShipmentParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params GetShipmentParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.Read, "shipment:read")
+		meta, err := validateCall(ctx, getShipmentTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -110,7 +110,7 @@ func getShipmentHandler(svc *commerce.Service) mcp.ToolHandlerFor[GetShipmentPar
 
 func checkInventoryHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckInventoryParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CheckInventoryParams) (*mcp.CallToolResult, any, error) {
-		_, err := validateCall(ctx, toolkit.Read, "inventory:read")
+		_, err := validateCall(ctx, checkInventoryTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -124,7 +124,7 @@ func checkInventoryHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckInvent
 
 func checkEligibilityHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckEligibilityParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CheckEligibilityParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.Read, "eligibility:read")
+		meta, err := validateCall(ctx, checkEligibilityTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -138,7 +138,7 @@ func checkEligibilityHandler(svc *commerce.Service) mcp.ToolHandlerFor[CheckElig
 
 func createReturnHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReturnParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CreateReturnParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.Write, "return:write")
+		meta, err := validateCall(ctx, createReturnTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -152,7 +152,7 @@ func createReturnHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReturnP
 
 func createReplacementHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateReplacementParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params CreateReplacementParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.Write, "replacement:write")
+		meta, err := validateCall(ctx, createReplacementTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -166,7 +166,7 @@ func createReplacementHandler(svc *commerce.Service) mcp.ToolHandlerFor[CreateRe
 
 func issueRefundHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueRefundParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params IssueRefundParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.HighRiskWrite, "refund:write")
+		meta, err := validateCall(ctx, issueRefundTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -180,7 +180,7 @@ func issueRefundHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueRefundPar
 
 func issueCouponHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueCouponParams, any] {
 	return func(ctx context.Context, _ *mcp.CallToolRequest, params IssueCouponParams) (*mcp.CallToolResult, any, error) {
-		meta, err := validateCall(ctx, toolkit.HighRiskWrite, "coupon:write")
+		meta, err := validateCall(ctx, issueCouponTool)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -192,15 +192,15 @@ func issueCouponHandler(svc *commerce.Service) mcp.ToolHandlerFor[IssueCouponPar
 	}
 }
 
-func validateCall(ctx context.Context, risk toolkit.Risk, scope string) (toolkit.CallContext, error) {
+func validateCall(ctx context.Context, contract toolContract) (toolkit.CallContext, error) {
 	meta, err := toolkit.FromContext(ctx)
 	if err != nil {
 		return toolkit.CallContext{}, err
 	}
-	if err := meta.Validate(risk); err != nil {
+	if err := meta.Validate(contract.Risk); err != nil {
 		return toolkit.CallContext{}, err
 	}
-	if !meta.HasScope(scope) {
+	if !meta.HasScope(contract.Scope) {
 		return toolkit.CallContext{}, commerce.ErrForbidden
 	}
 	return meta, nil

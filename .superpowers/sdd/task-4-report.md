@@ -156,3 +156,64 @@ No commerce service rules or Postgres store files were changed.
 - Used a shared unexported `validateCall` helper to apply the same ordered
   context, risk, and scope checks in every handler. Behavior and exact scopes
   remain those specified by the brief.
+
+## Review Follow-up: Transport and Tool Contracts (2026-08-13)
+
+### Findings and Fixes
+
+- `http.MaxBytesHandler` alone delegated an over-limit read to the MCP SDK,
+  whose transport maps `*http.MaxBytesError` to HTTP 400. The production chain
+  now authenticates first, then reads at most 1 MiB plus one byte into a fixed
+  buffer. It returns HTTP 413 itself for an oversized request, including a
+  request with unknown/chunked content length, replaces an in-limit body with a
+  fresh readable stream, and retains `http.MaxBytesHandler` around the SDK as
+  defense in depth.
+- Tool registration and handler validation previously repeated names,
+  descriptions, risks, and scopes independently. Each of the eight tools now
+  has one `toolContract`; registration consumes its name and description, and
+  the corresponding handler passes that same contract to validation. This pins
+  `issue_refund` and `issue_coupon` to `toolkit.HighRiskWrite`.
+- MCP discovery now compares the complete description string for every tool,
+  not only the risk prefix.
+
+### RED
+
+```text
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test ./cmd/commerce-mcp -run 'TestMCPHandlerRejectsAuthenticatedOversizedRequestBeforeMCPParsing|TestMCPMuxPassesExactlyOneMiBBodyToDownstream|TestMCPHandlerRejectsUnauthenticatedOversizedRequestWithoutReadingBody' -v
+```
+
+Observed before the limiter change:
+
+```text
+TestMCPHandlerRejectsAuthenticatedOversizedRequestBeforeMCPParsing
+status = 400, want 413
+```
+
+The new contract test also failed before the contract implementation because
+`toolContract`, the eight named contracts, and `toolContracts` were undefined.
+
+### GREEN
+
+```text
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test ./cmd/commerce-mcp ./internal/mcpserver -v
+```
+
+Result: PASS. The HTTP tests cover a real `newMCPHandler(mcpserver.New(nil),
+token)` request with an authenticated, unknown-length oversized body returning
+413 before MCP parsing; an exactly 1 MiB body restored to a recording
+downstream; and an unauthenticated oversized request returning 401 with zero
+body bytes consumed. MCP tests assert all eight exact
+name/description/risk/scope contracts, exact discovery descriptions, and the
+per-handler contract scopes.
+
+### Final Verification
+
+```text
+gofmt -w cmd/commerce-mcp internal/mcpserver
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go test ./...
+GOCACHE=/private/tmp/actionguard-gocache GOPATH=/private/tmp/actionguard-gopath GOMODCACHE=/private/tmp/actionguard-gomodcache GOPROXY=https://proxy.golang.org,direct go vet ./...
+git diff --check
+```
+
+Result: all commands exited successfully. The full test suite passed for all
+packages with tests; `cmd/api` and `migrations` reported no test files.

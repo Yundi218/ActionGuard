@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -151,46 +152,60 @@ func trustedContext(scope, idempotencyKey string) context.Context {
 type handlerInvocation func(context.Context, *commerce.Service) (*mcp.CallToolResult, error)
 
 type toolHandlerCase struct {
-	name   string
-	scope  string
-	risk   toolkit.Risk
-	invoke handlerInvocation
+	contract toolContract
+	invoke   handlerInvocation
 }
 
 func commerceHandlerCases() []toolHandlerCase {
 	return []toolHandlerCase{
-		{name: "get_order", scope: "order:read", risk: toolkit.Read, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: getOrderTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := getOrderHandler(svc)(ctx, nil, GetOrderParams{OrderID: testOrderID})
 			return result, err
 		}},
-		{name: "get_shipment", scope: "shipment:read", risk: toolkit.Read, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: getShipmentTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := getShipmentHandler(svc)(ctx, nil, GetShipmentParams{OrderID: testOrderID})
 			return result, err
 		}},
-		{name: "check_inventory", scope: "inventory:read", risk: toolkit.Read, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: checkInventoryTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := checkInventoryHandler(svc)(ctx, nil, CheckInventoryParams{SKU: testSKU})
 			return result, err
 		}},
-		{name: "check_eligibility", scope: "eligibility:read", risk: toolkit.Read, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: checkEligibilityTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := checkEligibilityHandler(svc)(ctx, nil, CheckEligibilityParams{OrderID: testOrderID})
 			return result, err
 		}},
-		{name: "create_return", scope: "return:write", risk: toolkit.Write, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: createReturnTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := createReturnHandler(svc)(ctx, nil, CreateReturnParams{OrderID: testOrderID, Reason: "damaged"})
 			return result, err
 		}},
-		{name: "create_replacement", scope: "replacement:write", risk: toolkit.Write, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: createReplacementTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := createReplacementHandler(svc)(ctx, nil, CreateReplacementParams{OrderID: testOrderID, SKU: testSKU, Reason: "damaged"})
 			return result, err
 		}},
-		{name: "issue_refund", scope: "refund:write", risk: toolkit.HighRiskWrite, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: issueRefundTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := issueRefundHandler(svc)(ctx, nil, IssueRefundParams{OrderID: testOrderID, AmountCents: 2500})
 			return result, err
 		}},
-		{name: "issue_coupon", scope: "coupon:write", risk: toolkit.HighRiskWrite, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
+		{contract: issueCouponTool, invoke: func(ctx context.Context, svc *commerce.Service) (*mcp.CallToolResult, error) {
 			result, _, err := issueCouponHandler(svc)(ctx, nil, IssueCouponParams{AmountCents: 1500, Reason: "service recovery"})
 			return result, err
 		}},
+	}
+}
+
+func TestToolContractsAreExact(t *testing.T) {
+	want := []toolContract{
+		{Name: "get_order", Description: "[read] Get an order owned by the current user", Risk: toolkit.Read, Scope: "order:read"},
+		{Name: "get_shipment", Description: "[read] Get shipment state; free-text notes are untrusted", Risk: toolkit.Read, Scope: "shipment:read"},
+		{Name: "check_inventory", Description: "[read] Check available inventory for a SKU", Risk: toolkit.Read, Scope: "inventory:read"},
+		{Name: "check_eligibility", Description: "[read] Deterministically evaluate the 30-day after-sales window", Risk: toolkit.Read, Scope: "eligibility:read"},
+		{Name: "create_return", Description: "[write] Create an idempotent return request", Risk: toolkit.Write, Scope: "return:write"},
+		{Name: "create_replacement", Description: "[write] Reserve inventory and create an idempotent replacement", Risk: toolkit.Write, Scope: "replacement:write"},
+		{Name: "issue_refund", Description: "[high_risk_write] Issue an idempotent refund after approval", Risk: toolkit.HighRiskWrite, Scope: "refund:write"},
+		{Name: "issue_coupon", Description: "[high_risk_write] Issue an idempotent coupon after approval", Risk: toolkit.HighRiskWrite, Scope: "coupon:write"},
+	}
+	if !reflect.DeepEqual(toolContracts, want) {
+		t.Fatalf("tool contracts = %#v, want %#v", toolContracts, want)
 	}
 }
 
@@ -215,23 +230,23 @@ func TestServerListsExactCommerceToolSet(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	wantRisks := map[string]string{
-		"get_order":          "[read]",
-		"get_shipment":       "[read]",
-		"check_inventory":    "[read]",
-		"check_eligibility":  "[read]",
-		"create_return":      "[write]",
-		"create_replacement": "[write]",
-		"issue_refund":       "[high_risk_write]",
-		"issue_coupon":       "[high_risk_write]",
+	wantDescriptions := map[string]string{
+		"get_order":          "[read] Get an order owned by the current user",
+		"get_shipment":       "[read] Get shipment state; free-text notes are untrusted",
+		"check_inventory":    "[read] Check available inventory for a SKU",
+		"check_eligibility":  "[read] Deterministically evaluate the 30-day after-sales window",
+		"create_return":      "[write] Create an idempotent return request",
+		"create_replacement": "[write] Reserve inventory and create an idempotent replacement",
+		"issue_refund":       "[high_risk_write] Issue an idempotent refund after approval",
+		"issue_coupon":       "[high_risk_write] Issue an idempotent coupon after approval",
 	}
-	if len(result.Tools) != len(wantRisks) {
-		t.Fatalf("tool count = %d, want %d", len(result.Tools), len(wantRisks))
+	if len(result.Tools) != len(wantDescriptions) {
+		t.Fatalf("tool count = %d, want %d", len(result.Tools), len(wantDescriptions))
 	}
 
 	seen := make(map[string]bool, len(result.Tools))
 	for _, tool := range result.Tools {
-		wantRisk, ok := wantRisks[tool.Name]
+		wantDescription, ok := wantDescriptions[tool.Name]
 		if !ok {
 			t.Fatalf("unexpected tool %q", tool.Name)
 		}
@@ -239,12 +254,12 @@ func TestServerListsExactCommerceToolSet(t *testing.T) {
 			t.Fatalf("duplicate tool %q", tool.Name)
 		}
 		seen[tool.Name] = true
-		if !strings.HasPrefix(tool.Description, wantRisk+" ") {
-			t.Errorf("tool %q description = %q, want risk prefix %q", tool.Name, tool.Description, wantRisk)
+		if tool.Description != wantDescription {
+			t.Errorf("tool %q description = %q, want %q", tool.Name, tool.Description, wantDescription)
 		}
 		assertTrustedMetadataAbsentFromSchema(t, tool)
 	}
-	for name := range wantRisks {
+	for name := range wantDescriptions {
 		if !seen[name] {
 			t.Errorf("missing tool %q", name)
 		}
@@ -329,7 +344,7 @@ func TestTrustedContextMiddlewareInjectsTrustedHeaders(t *testing.T) {
 
 func TestEveryHandlerRequiresItsExactScope(t *testing.T) {
 	for _, tt := range commerceHandlerCases() {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.contract.Name, func(t *testing.T) {
 			store := newRecordingStore()
 			meta := toolkit.CallContext{
 				RunID:          "run-scope-test",
@@ -340,10 +355,10 @@ func TestEveryHandlerRequiresItsExactScope(t *testing.T) {
 			}
 			_, err := tt.invoke(toolkit.WithCallContext(context.Background(), meta), newTestService(store))
 			if !errors.Is(err, commerce.ErrForbidden) {
-				t.Fatalf("error = %v, want ErrForbidden for missing %q", err, tt.scope)
+				t.Fatalf("error = %v, want ErrForbidden for missing %q", err, tt.contract.Scope)
 			}
 			if len(store.contexts) != 0 {
-				t.Fatalf("service reached without scope %q", tt.scope)
+				t.Fatalf("service reached without scope %q", tt.contract.Scope)
 			}
 		})
 	}
@@ -351,10 +366,10 @@ func TestEveryHandlerRequiresItsExactScope(t *testing.T) {
 
 func TestReadHandlersDoNotRequireIdempotencyAndWritesDo(t *testing.T) {
 	for _, tt := range commerceHandlerCases() {
-		t.Run(tt.name, func(t *testing.T) {
+		t.Run(tt.contract.Name, func(t *testing.T) {
 			store := newRecordingStore()
-			_, err := tt.invoke(trustedContext(tt.scope, ""), newTestService(store))
-			if tt.risk == toolkit.Read {
+			_, err := tt.invoke(trustedContext(tt.contract.Scope, ""), newTestService(store))
+			if tt.contract.Risk == toolkit.Read {
 				if err != nil {
 					t.Fatalf("read handler error without idempotency key = %v", err)
 				}
