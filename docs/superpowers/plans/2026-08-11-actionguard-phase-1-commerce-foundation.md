@@ -337,7 +337,7 @@ git commit -m "feat: bootstrap ActionGuard services"
 
 - [ ] **Step 1: Add pgx and write a failing migration test**
 
-Run: `go get github.com/jackc/pgx/v5@v5.10.0`
+Run: `go get github.com/jackc/pgx/v5@v5.8.0`
 
 Create `internal/database/migrate_test.go`:
 
