@@ -1235,7 +1235,7 @@ git commit -m "feat: expose commerce operations over MCP"
 - Create: `scripts/load-fixtures.sh`
 - Create: `internal/mcpserver/e2e_test.go`
 - Create: `.github/workflows/ci.yml`
-- Create: `README.md`
+- Modify: `README.md`
 - Modify: `Makefile`
 - Modify: `deploy/docker-compose.yml`
 
@@ -1412,7 +1412,8 @@ jobs:
 
 - [ ] **Step 6: Write the Phase 1 README**
 
-Create `README.md` with these sections and exact claims:
+Update the existing `README.md` with these sections and exact claims while preserving
+useful project context already present:
 
 - Project statement: “A policy-constrained transactional Agent built on a deterministic commerce simulator.”
 - Current status: “Phase 1 implements the simulator and MCP tool layer; LLM orchestration is not implemented yet.”
@@ -1433,13 +1434,14 @@ Run: `git status --short`
 
 Expected before commit: only Phase 1 Task 5 files are listed.
 
-- [ ] **Step 8: Commit and push Phase 1**
+- [ ] **Step 8: Commit Phase 1**
 
 ```bash
 git add fixtures scripts internal/mcpserver/e2e_test.go .github README.md Makefile deploy
 git commit -m "test: add reproducible commerce MCP demo"
-git push origin main
 ```
+
+Push the reviewed feature branch only after the final broad review and verification.
 
 ---
 
