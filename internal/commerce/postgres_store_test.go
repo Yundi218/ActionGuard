@@ -89,8 +89,12 @@ func TestPostgresStoreCreateReturnIsIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if first.ResourceID != second.ResourceID || !second.Replayed {
+	if first.Replayed || !second.Replayed {
 		t.Fatalf("first/second = %#v/%#v", first, second)
+	}
+	second.Replayed = false
+	if first != second {
+		t.Fatalf("replayed result differs from original: first/second = %#v/%#v", first, second)
 	}
 }
 
@@ -191,6 +195,112 @@ func TestPostgresStoreCreateReturnSerializesConcurrentSameKey(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreCreateReturnWaitsForSameIdempotencyLock(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	const operation = createReturnOperation
+	const key = "return-key-lock-held"
+
+	holder, err := store.pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+
+	lockTx, err := holder.Conn().Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = lockTx.Rollback(ctx)
+		}
+	}()
+
+	if _, err := lockTx.Exec(ctx, `
+		select pg_advisory_xact_lock(hashtextextended($1 || ':' || $2, 0))
+	`, operation, key); err != nil {
+		t.Fatal(err)
+	}
+
+	var classID, objectID int64
+	var objectSubID int32
+	if err := lockTx.QueryRow(ctx, `
+		select classid::bigint, objid::bigint, objsubid
+		from pg_locks
+		where pid = pg_backend_pid()
+		  and locktype = 'advisory'
+		  and granted
+		limit 1
+	`).Scan(&classID, &objectID, &objectSubID); err != nil {
+		t.Fatal(err)
+	}
+
+	type outcome struct {
+		result WriteResult
+		err    error
+	}
+	started := make(chan struct{})
+	done := make(chan outcome, 1)
+	go func() {
+		close(started)
+		result, err := store.CreateReturn(ctx, "AG-1042", "damaged", key)
+		done <- outcome{result: result, err: err}
+	}()
+	<-started
+
+	deadline := time.NewTimer(2 * time.Second)
+	defer deadline.Stop()
+	for {
+		var waiting int
+		err := store.pool.QueryRow(ctx, `
+			select count(*)
+			from pg_locks
+			where locktype = 'advisory'
+			  and not granted
+			  and classid = $1
+			  and objid = $2
+			  and objsubid = $3
+		`, classID, objectID, objectSubID).Scan(&waiting)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 1 {
+			break
+		}
+
+		select {
+		case <-deadline.C:
+			t.Fatal("store write did not wait for the held advisory lock")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	select {
+	case result := <-done:
+		t.Fatalf("store write completed before the advisory lock was released: %#v", result)
+	default:
+	}
+
+	if err := lockTx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	committed = true
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatal(result.err)
+		}
+		if result.result.ResourceType != "return" || result.result.ResourceID == "" || result.result.Replayed {
+			t.Fatalf("result = %#v", result.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("store write did not complete after the advisory lock was released")
+	}
+}
+
 func TestPostgresStoreCreateReplacementReservesInventory(t *testing.T) {
 	store := newTestStore(t)
 
@@ -216,6 +326,44 @@ func TestPostgresStoreIssueRefundUpdatesOrderBalance(t *testing.T) {
 	order, err := store.GetOrder(context.Background(), "AG-1042")
 	if err != nil || order.RefundedAmountCents != 800 {
 		t.Fatalf("order = %#v, err = %v", order, err)
+	}
+}
+
+func TestPostgresStoreIssueRefundRollsBackAfterOverRefund(t *testing.T) {
+	store := newTestStore(t)
+	const key = "refund-key-over-limit"
+
+	_, err := store.IssueRefund(context.Background(), "AG-1042", 13000, key)
+	if err == nil {
+		t.Fatal("IssueRefund returned nil error for an over-refund")
+	}
+
+	var refundCount int
+	if err := store.pool.QueryRow(context.Background(), `select count(*) from refunds`).Scan(&refundCount); err != nil {
+		t.Fatal(err)
+	}
+	if refundCount != 0 {
+		t.Fatalf("refund count = %d, want 0", refundCount)
+	}
+
+	var idempotencyCount int
+	if err := store.pool.QueryRow(context.Background(), `
+		select count(*)
+		from idempotency_records
+		where operation = $1 and idempotency_key = $2
+	`, issueRefundOperation, key).Scan(&idempotencyCount); err != nil {
+		t.Fatal(err)
+	}
+	if idempotencyCount != 0 {
+		t.Fatalf("idempotency record count = %d, want 0", idempotencyCount)
+	}
+
+	order, err := store.GetOrder(context.Background(), "AG-1042")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if order.RefundedAmountCents != 0 {
+		t.Fatalf("refunded amount = %d, want 0", order.RefundedAmountCents)
 	}
 }
 
