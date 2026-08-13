@@ -136,6 +136,9 @@ func matchesCanonicalContract(contract toolkit.Contract) bool {
 }
 
 func schemasEquivalent(left, right json.RawMessage) bool {
+	if rejectDuplicateJSONMembers(left) != nil || rejectDuplicateJSONMembers(right) != nil {
+		return false
+	}
 	var leftValue, rightValue any
 	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
 		return false

@@ -109,6 +109,9 @@ func TestFixturePlannerRejectsMismatchedCanonicalToolContracts(t *testing.T) {
 		{name: "input schema", mutate: func(contract *toolkit.Contract) {
 			contract.InputSchema = json.RawMessage(`{"additionalProperties":false,"properties":{"order_id":{"type":"integer"}},"required":["order_id"],"type":"object"}`)
 		}},
+		{name: "duplicate nested schema key", mutate: func(contract *toolkit.Contract) {
+			contract.InputSchema = json.RawMessage(`{"additionalProperties":false,"properties":{"order_id":{"type":"integer","description":"Order identifier","type":"string"}},"required":["order_id"],"type":"object"}`)
+		}},
 		{name: "description", mutate: func(contract *toolkit.Contract) { contract.Description = "forged description" }},
 	}
 	for _, test := range tests {

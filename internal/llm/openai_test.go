@@ -114,6 +114,10 @@ func TestOpenAIPlannerRejectsInvalidResponsesWithoutRetryOrLeakage(t *testing.T)
 		{name: "multiple output text", statusCode: http.StatusOK, body: fmt.Sprintf(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q},{"type":"output_text","text":%q}]}]}`, lookupPlanJSON(), lookupPlanJSON()), want: ErrInvalidResponse},
 		{name: "invalid plan json", statusCode: http.StatusOK, body: `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"body-secret not-json"}]}]}`, want: ErrInvalidResponse},
 		{name: "unknown plan field", statusCode: http.StatusOK, body: `{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"{\"goal\":\"lookup\",\"policy_refs\":[],\"steps\":[],\"body-secret\":true}"}]}]}`, want: ErrInvalidResponse},
+		{name: "duplicate status", statusCode: http.StatusOK, body: fmt.Sprintf(`{"status":"incomplete","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, lookupPlanJSON()), want: ErrInvalidResponse},
+		{name: "duplicate output", statusCode: http.StatusOK, body: fmt.Sprintf(`{"status":"completed","output":[],"output":[{"type":"message","content":[{"type":"output_text","text":%q}]}]}`, lookupPlanJSON()), want: ErrInvalidResponse},
+		{name: "duplicate content type masks refusal", statusCode: http.StatusOK, body: fmt.Sprintf(`{"status":"completed","output":[{"type":"message","content":[{"type":"refusal","type":"output_text","refusal":"body-secret refusal","text":%q}]}]}`, lookupPlanJSON()), want: ErrInvalidResponse},
+		{name: "duplicate refusal", statusCode: http.StatusOK, body: fmt.Sprintf(`{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","refusal":"body-secret first","refusal":"body-secret second","text":%q}]}]}`, lookupPlanJSON()), want: ErrInvalidResponse},
 		{name: "non retryable status", statusCode: http.StatusBadRequest, body: `body-secret invalid request`, want: ErrRequestFailed},
 	}
 	for _, test := range tests {
@@ -310,12 +314,15 @@ func TestOpenAIEmbedderRejectsMalformedVectorsWithoutLeakage(t *testing.T) {
 		{name: "wrong width", body: `{"data":[{"index":0,"embedding":[1]}]}`},
 		{name: "missing vector", body: `{"data":[]}`},
 		{name: "missing index", body: fmt.Sprintf(`{"data":[{"embedding":%s}]}`, vectorJSON(t, finiteVector(1)))},
+		{name: "duplicate index member", body: fmt.Sprintf(`{"data":[{"index":1,"index":0,"embedding":%s}]}`, vectorJSON(t, finiteVector(1)))},
 		{name: "duplicate index", body: fmt.Sprintf(`{"data":[{"index":0,"embedding":%s},{"index":0,"embedding":%s}]}`, vectorJSON(t, finiteVector(1)), vectorJSON(t, finiteVector(2)))},
 		{name: "non finite", body: `{"data":[{"index":0,"embedding":[1e999]}]}`},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			var attempts atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				attempts.Add(1)
 				_, _ = writer.Write([]byte(strings.ReplaceAll(test.body, "finite-secret", "body-secret")))
 			}))
 			t.Cleanup(server.Close)
@@ -323,6 +330,9 @@ func TestOpenAIEmbedderRejectsMalformedVectorsWithoutLeakage(t *testing.T) {
 			_, err := embedder.Embed(context.Background(), []string{"private embedding input"})
 			if !errors.Is(err, ErrInvalidResponse) {
 				t.Fatalf("error = %v, want ErrInvalidResponse", err)
+			}
+			if attempts.Load() != 1 {
+				t.Fatalf("attempts = %d, want 1", attempts.Load())
 			}
 			assertSanitizedError(t, err)
 		})

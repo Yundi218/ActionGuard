@@ -282,6 +282,9 @@ func inputItem(role, text string) responseInputItem {
 }
 
 func decodePlanResponse(body []byte) (agent.ActionPlan, error) {
+	if rejectDuplicateJSONMembers(body) != nil {
+		return agent.ActionPlan{}, ErrInvalidResponse
+	}
 	var envelope responsesEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return agent.ActionPlan{}, ErrInvalidResponse
@@ -331,6 +334,9 @@ func (embedder *OpenAIEmbedder) Embed(ctx context.Context, texts []string) ([][]
 	})
 	if err != nil {
 		return nil, err
+	}
+	if rejectDuplicateJSONMembers(body) != nil {
+		return nil, ErrInvalidResponse
 	}
 	var envelope embeddingsEnvelope
 	if err := json.Unmarshal(body, &envelope); err != nil || len(envelope.Data) != len(texts) {
