@@ -201,16 +201,16 @@ RUNNING -> COMPENSATING -> COMPENSATED
 
 首版工具：
 
-| 工具 | 风险 | 功能 |
-|---|---|---|
-| `get_order` | read | 查询订单、付款和已退款金额 |
-| `get_shipment` | read | 查询物流状态与关键时间 |
-| `check_inventory` | read | 查询目标 SKU 库存 |
-| `check_eligibility` | read | 根据确定性规则计算售后资格 |
-| `create_return` | write | 创建退货申请和退货标签 |
-| `create_replacement` | write | 预占库存并创建换货单 |
-| `issue_refund` | high_risk_write | 创建退款交易 |
-| `issue_coupon` | high_risk_write | 发放优惠补偿 |
+| 工具 | 风险 | Scope | 功能 |
+|---|---|---|---|
+| `get_order` | read | `order:read` | 查询订单、付款和已退款金额 |
+| `get_shipment` | read | `shipment:read` | 查询物流状态与关键时间 |
+| `check_inventory` | read | `inventory:read` | 查询目标 SKU 库存 |
+| `check_eligibility` | read | `eligibility:read` | 根据确定性规则计算售后资格 |
+| `create_return` | write | `return:write` | 创建退货申请和退货标签 |
+| `create_replacement` | write | `replacement:write` | 预占库存并创建换货单 |
+| `issue_refund` | high_risk_write | `refund:write` | 创建退款交易 |
+| `issue_coupon` | high_risk_write | `coupon:write` | 发放优惠补偿 |
 
 ### 5.8 Commerce Simulator
 

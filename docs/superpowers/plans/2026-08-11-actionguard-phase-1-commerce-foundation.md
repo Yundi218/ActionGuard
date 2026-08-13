@@ -1053,6 +1053,10 @@ type IssueCouponParams struct {
 
 Identity, Scope, run metadata, and idempotency keys are not Tool arguments. `TrustedContextMiddleware` first validates `Authorization: Bearer <MCP_GATEWAY_TOKEN>`, then reads `X-ActionGuard-User`, `X-ActionGuard-Run`, `X-ActionGuard-Step`, `X-ActionGuard-Scopes`, and `Idempotency-Key` headers supplied by the trusted Gateway and stores a `toolkit.CallContext` in the request context. Each handler loads that context with `toolkit.FromContext`, calls `Validate(risk)`, requires its exact Scope, invokes `commerce.Service`, and JSON-encodes `toolkit.Envelope[T]` into a `mcp.TextContent`. Shipment notes and product descriptions go only into `UntrustedText`.
 
+Use these exact scopes: `order:read`, `shipment:read`, `inventory:read`,
+`eligibility:read`, `return:write`, `replacement:write`, `refund:write`, and
+`coupon:write`, corresponding to the eight tools in registration order.
+
 Implement the middleware in `internal/mcpserver/handlers.go`:
 
 ```go
