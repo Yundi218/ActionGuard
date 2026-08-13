@@ -68,7 +68,7 @@ func newTestStore(t *testing.T) *PostgresStore {
 		args  []any
 	}{
 		{`insert into users (id, display_name) values ($1, $2)`, []any{"user_018", "Ari Example"}},
-		{`insert into products (sku, name) values ($1, $2)`, []any{"SKU-RED-42", "Red Widget"}},
+		{`insert into products (sku, name, category) values ($1, $2, $3)`, []any{"SKU-RED-42", "Red Widget", "electronics"}},
 		{`insert into inventory (sku, available, reserved) values ($1, $2, $3)`, []any{"SKU-RED-42", 4, 0}},
 		{`insert into orders (id, user_id, sku, status, paid_amount_cents, delivered_at) values ($1, $2, $3, $4, $5, $6)`, []any{"AG-1042", "user_018", "SKU-RED-42", "delivered", int64(12900), deliveredAt}},
 		{`insert into shipments (id, order_id, status, untrusted_note) values ($1, $2, $3, $4)`, []any{"SHIP-1042", "AG-1042", "delivered", "Left with concierge"}},
@@ -87,6 +87,24 @@ func TestPostgresStoreGetOrder(t *testing.T) {
 	order, err := store.GetOrder(context.Background(), "AG-1042")
 	if err != nil || order.UserID != "user_018" || order.PaidAmountCents != 12900 {
 		t.Fatalf("order = %#v, err = %v", order, err)
+	}
+}
+
+func TestPostgresStoreGetProductCategory(t *testing.T) {
+	store := newTestStore(t)
+
+	category, err := store.GetProductCategory(context.Background(), "SKU-RED-42")
+	if err != nil || category != "electronics" {
+		t.Fatalf("category = %q, err = %v", category, err)
+	}
+}
+
+func TestPostgresStoreGetProductCategoryReturnsStableNotFound(t *testing.T) {
+	store := newTestStore(t)
+
+	category, err := store.GetProductCategory(context.Background(), "SKU-MISSING")
+	if category != "" || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("category = %q, err = %v, want empty category and ErrNotFound", category, err)
 	}
 }
 

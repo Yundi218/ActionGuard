@@ -47,6 +47,19 @@ func (s *PostgresStore) GetOrder(ctx context.Context, id string) (Order, error) 
 	return order, err
 }
 
+func (s *PostgresStore) GetProductCategory(ctx context.Context, sku string) (string, error) {
+	var category string
+	err := s.pool.QueryRow(ctx, `
+		select category
+		from products
+		where sku = $1
+	`, sku).Scan(&category)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return category, err
+}
+
 func (s *PostgresStore) GetShipmentByOrder(ctx context.Context, orderID string) (Shipment, error) {
 	var shipment Shipment
 	err := s.pool.QueryRow(ctx, `

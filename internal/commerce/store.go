@@ -7,6 +7,7 @@ import (
 
 type Store interface {
 	GetOrder(context.Context, string) (Order, error)
+	GetProductCategory(context.Context, string) (string, error)
 	GetShipmentByOrder(context.Context, string) (Shipment, error)
 	GetInventory(context.Context, string) (Inventory, error)
 	ReplayWrite(context.Context, IdempotencyIdentity) (WriteResult, bool, error)

@@ -24,6 +24,18 @@ func (s *Service) GetOrder(ctx context.Context, userID, orderID string) (Order, 
 	return s.ownedOrder(ctx, userID, orderID)
 }
 
+func (s *Service) ResolveOrderContext(ctx context.Context, userID, orderID string) (OrderContext, error) {
+	order, err := s.ownedOrder(ctx, userID, orderID)
+	if err != nil {
+		return OrderContext{}, err
+	}
+	category, err := s.store.GetProductCategory(ctx, order.SKU)
+	if err != nil {
+		return OrderContext{}, err
+	}
+	return OrderContext{Order: order, ProductCategory: category}, nil
+}
+
 func (s *Service) GetShipment(ctx context.Context, userID, orderID string) (Shipment, error) {
 	if _, err := s.ownedOrder(ctx, userID, orderID); err != nil {
 		return Shipment{}, err

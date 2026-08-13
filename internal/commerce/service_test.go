@@ -11,25 +11,28 @@ import (
 var errStorage = errors.New("storage unavailable")
 
 type fakeStore struct {
-	order     Order
-	shipment  Shipment
-	inventory Inventory
-	result    WriteResult
+	order           Order
+	shipment        Shipment
+	inventory       Inventory
+	productCategory string
+	result          WriteResult
 
-	getOrderErr    error
-	shipmentErr    error
-	inventoryErr   error
-	returnErr      error
-	replacementErr error
-	refundErr      error
-	couponErr      error
-	replayErr      error
-	replayResult   WriteResult
-	replayed       bool
+	getOrderErr        error
+	shipmentErr        error
+	inventoryErr       error
+	productCategoryErr error
+	returnErr          error
+	replacementErr     error
+	refundErr          error
+	couponErr          error
+	replayErr          error
+	replayResult       WriteResult
+	replayed           bool
 
 	getOrderIDs    []string
 	shipmentOrders []string
 	inventorySKUs  []string
+	categorySKUs   []string
 	returnCalls    []returnCall
 	replaceCalls   []replacementCall
 	refundCalls    []refundCall
@@ -39,6 +42,7 @@ type fakeStore struct {
 	getOrderContexts    []context.Context
 	shipmentContexts    []context.Context
 	inventoryContexts   []context.Context
+	categoryContexts    []context.Context
 	returnContexts      []context.Context
 	replacementContexts []context.Context
 	refundContexts      []context.Context
@@ -97,6 +101,15 @@ func (f *fakeStore) GetInventory(ctx context.Context, sku string) (Inventory, er
 		return Inventory{}, fmt.Errorf("get inventory: %w", f.inventoryErr)
 	}
 	return f.inventory, nil
+}
+
+func (f *fakeStore) GetProductCategory(ctx context.Context, sku string) (string, error) {
+	f.categorySKUs = append(f.categorySKUs, sku)
+	f.categoryContexts = append(f.categoryContexts, ctx)
+	if f.productCategoryErr != nil {
+		return "", fmt.Errorf("get product category: %w", f.productCategoryErr)
+	}
+	return f.productCategory, nil
 }
 
 func (f *fakeStore) ReplayWrite(ctx context.Context, identity IdempotencyIdentity) (WriteResult, bool, error) {
@@ -168,6 +181,50 @@ func TestServiceGetOrderForwardsOrderID(t *testing.T) {
 	got, err := NewService(store).GetOrder(context.Background(), "user_018", "AG-1042")
 	if err != nil || got.ID != "AG-1042" || len(store.getOrderIDs) != 1 || store.getOrderIDs[0] != "AG-1042" {
 		t.Fatalf("order = %#v, calls = %#v, err = %v", got, store.getOrderIDs, err)
+	}
+}
+
+func TestServiceResolveOrderContextChecksOwnershipBeforeProductCategory(t *testing.T) {
+	store := &fakeStore{
+		order:           Order{ID: "AG-1042", UserID: "user_018", SKU: "SKU-RED-42"},
+		productCategory: "electronics",
+	}
+
+	got, err := NewService(store).ResolveOrderContext(context.Background(), "user_999", "AG-1042")
+	if got != (OrderContext{}) || !errors.Is(err, ErrForbidden) {
+		t.Fatalf("context = %#v, err = %v, want empty context and ErrForbidden", got, err)
+	}
+	if len(store.categorySKUs) != 0 {
+		t.Fatalf("category lookup occurred before ownership check: %v", store.categorySKUs)
+	}
+}
+
+func TestServiceResolveOrderContextReturnsOwnedOrderAndProductCategory(t *testing.T) {
+	ctx := context.WithValue(context.Background(), struct{}{}, "request-context")
+	order := Order{ID: "AG-1042", UserID: "user_018", SKU: "SKU-RED-42"}
+	store := &fakeStore{order: order, productCategory: "electronics"}
+
+	got, err := NewService(store).ResolveOrderContext(ctx, "user_018", "AG-1042")
+	if err != nil || got != (OrderContext{Order: order, ProductCategory: "electronics"}) {
+		t.Fatalf("context = %#v, err = %v", got, err)
+	}
+	if fmt.Sprint(store.getOrderIDs) != fmt.Sprint([]string{"AG-1042"}) || fmt.Sprint(store.categorySKUs) != fmt.Sprint([]string{"SKU-RED-42"}) {
+		t.Fatalf("order/category calls = %v/%v", store.getOrderIDs, store.categorySKUs)
+	}
+	if len(store.categoryContexts) != 1 || store.categoryContexts[0] != ctx {
+		t.Fatalf("category contexts = %#v, want original context", store.categoryContexts)
+	}
+}
+
+func TestServiceResolveOrderContextPreservesStableProductError(t *testing.T) {
+	store := &fakeStore{
+		order:              Order{ID: "AG-1042", UserID: "user_018", SKU: "SKU-MISSING"},
+		productCategoryErr: ErrNotFound,
+	}
+
+	got, err := NewService(store).ResolveOrderContext(context.Background(), "user_018", "AG-1042")
+	if got != (OrderContext{}) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("context = %#v, err = %v, want empty context and ErrNotFound", got, err)
 	}
 }
 

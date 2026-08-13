@@ -12,6 +12,11 @@ type Order struct {
 	DeliveredAt         *time.Time
 }
 
+type OrderContext struct {
+	Order           Order
+	ProductCategory string
+}
+
 type Shipment struct {
 	ID            string
 	OrderID       string
