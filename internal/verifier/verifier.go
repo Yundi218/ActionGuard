@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"math/big"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +17,7 @@ import (
 	"github.com/Yundi218/ActionGuard/internal/commerce"
 	"github.com/Yundi218/ActionGuard/internal/policy"
 	"github.com/Yundi218/ActionGuard/internal/toolkit"
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 const (
@@ -82,20 +85,21 @@ type verificationState struct {
 	contracts          []toolkit.Contract
 	contractsByName    map[string]toolkit.Contract
 	scopeSet           map[string]struct{}
-	parsedArguments    []map[string]json.RawMessage
+	parsedArguments    []map[string]any
 	evidenceByID       map[string]policy.Evidence
 	applicableEvidence map[string][]policy.Evidence
 	errors             []Error
 }
 
 func (verifier *Verifier) VerifyAndSeal(ctx context.Context, plan agent.ActionPlan, verificationContext Context) (VerifiedPlan, Result) {
+	planSnapshot := clonePlan(plan)
 	canonicalScopes := canonicalScopes(verificationContext.Scopes)
 	state := verificationState{
-		plan:               plan,
+		plan:               planSnapshot,
 		context:            verificationContext,
 		contracts:          toolkit.Registry(),
 		scopeSet:           make(map[string]struct{}, len(canonicalScopes)),
-		parsedArguments:    make([]map[string]json.RawMessage, len(plan.Steps)),
+		parsedArguments:    make([]map[string]any, len(planSnapshot.Steps)),
 		evidenceByID:       make(map[string]policy.Evidence, len(verificationContext.Evidence)),
 		applicableEvidence: make(map[string][]policy.Evidence),
 	}
@@ -118,6 +122,7 @@ func (verifier *Verifier) VerifyAndSeal(ctx context.Context, plan agent.ActionPl
 	state.validateEvidence()
 	state.validateContracts()
 	state.validateGraph()
+	state.validateBindings()
 	state.validateWriteEvidence()
 	state.validateFactsAndAmounts(ctx, verifier)
 
@@ -126,7 +131,7 @@ func (verifier *Verifier) VerifyAndSeal(ctx context.Context, plan agent.ActionPl
 	}
 	digest := sha256.Sum256([]byte(strings.Join(canonicalScopes, "\x00")))
 	return VerifiedPlan{
-		plan: clonePlan(plan), userID: verificationContext.UserID,
+		plan: clonePlan(planSnapshot), userID: verificationContext.UserID,
 		scopes: append([]string{}, canonicalScopes...), scopeDigest: digest,
 	}, Result{Valid: true}
 }
@@ -179,15 +184,12 @@ func (state *verificationState) validateContracts() {
 		if err != nil {
 			state.add("invalid_arguments", step.ID, "arguments", "arguments do not match the registered tool schema")
 		} else {
-			state.parsedArguments[index] = arguments
-			canonical, canonicalErr := canonicalArguments(arguments)
-			if canonicalErr == nil {
-				actionKey := step.Tool + "\x00" + canonical
-				if _, duplicate := seenActions[actionKey]; duplicate {
-					state.add("duplicate_action", step.ID, "arguments", "duplicate tool and arguments are not allowed")
-				} else {
-					seenActions[actionKey] = struct{}{}
-				}
+			state.parsedArguments[index] = arguments.values
+			actionKey := step.Tool + "\x00" + arguments.canonical
+			if _, duplicate := seenActions[actionKey]; duplicate {
+				state.add("duplicate_action", step.ID, "arguments", "duplicate tool and arguments are not allowed")
+			} else {
+				seenActions[actionKey] = struct{}{}
 			}
 		}
 		if step.Risk != contract.Risk {
@@ -319,6 +321,41 @@ func (state *verificationState) validateWriteEvidence() {
 	}
 }
 
+func (state *verificationState) validateBindings() {
+	byID := make(map[string]int, len(state.plan.Steps))
+	for index, step := range state.plan.Steps {
+		if step.ID == "" {
+			continue
+		}
+		if _, duplicate := byID[step.ID]; duplicate {
+			continue
+		}
+		byID[step.ID] = index
+	}
+
+	for replacementIndex, replacement := range state.plan.Steps {
+		if replacement.Tool != "create_replacement" || state.parsedArguments[replacementIndex] == nil {
+			continue
+		}
+		replacementSKU, ok := stringArgument(state.parsedArguments[replacementIndex], "sku")
+		if !ok {
+			continue
+		}
+		ancestors := make(map[string]struct{}, len(state.plan.Steps))
+		collectAncestors(replacement.ID, state.plan.Steps, byID, ancestors)
+		for ancestorID := range ancestors {
+			ancestorIndex, exists := byID[ancestorID]
+			if !exists || state.plan.Steps[ancestorIndex].Tool != "check_inventory" || state.parsedArguments[ancestorIndex] == nil {
+				continue
+			}
+			inventorySKU, ok := stringArgument(state.parsedArguments[ancestorIndex], "sku")
+			if ok && inventorySKU != replacementSKU {
+				state.add("sku_mismatch", replacement.ID, "arguments.sku", "replacement sku must exactly match every prerequisite inventory check")
+			}
+		}
+	}
+}
+
 func (state *verificationState) validateFactsAndAmounts(ctx context.Context, verifier *Verifier) {
 	type factResult struct {
 		order commerce.Order
@@ -407,88 +444,202 @@ func (state *verificationState) add(code, stepID, field, message string) {
 	state.errors = append(state.errors, candidate)
 }
 
-type inputSchema struct {
-	Type                 string                    `json:"type"`
-	Properties           map[string]propertySchema `json:"properties"`
-	Required             []string                  `json:"required"`
-	AdditionalProperties bool                      `json:"additionalProperties"`
+type validatedArguments struct {
+	values    map[string]any
+	canonical string
 }
 
-type propertySchema struct {
-	Type string `json:"type"`
-}
-
-func validateArguments(arguments, schemaJSON json.RawMessage) (map[string]json.RawMessage, error) {
+func validateArguments(arguments, schemaJSON json.RawMessage) (validatedArguments, error) {
 	if trimmed := bytes.TrimSpace(arguments); len(trimmed) == 0 || trimmed[0] != '{' {
-		return nil, errors.New("arguments must be an object")
+		return validatedArguments{}, errors.New("arguments must be an object")
 	}
-	var schema inputSchema
-	if err := json.Unmarshal(schemaJSON, &schema); err != nil || schema.Type != "object" || schema.AdditionalProperties {
-		return nil, errors.New("invalid registry schema")
+	value, err := decodeStrictJSON(arguments)
+	if err != nil {
+		return validatedArguments{}, err
 	}
-	var values map[string]json.RawMessage
-	if err := json.Unmarshal(arguments, &values); err != nil || values == nil {
-		return nil, errors.New("invalid arguments")
+	values, ok := value.(map[string]any)
+	if !ok {
+		return validatedArguments{}, errors.New("arguments must be an object")
 	}
-	for _, required := range schema.Required {
-		if _, exists := values[required]; !exists {
-			return nil, fmt.Errorf("missing required argument %q", required)
-		}
+
+	var schema jsonschema.Schema
+	if err := json.Unmarshal(schemaJSON, &schema); err != nil {
+		return validatedArguments{}, fmt.Errorf("decode registry schema: %w", err)
 	}
-	for name, value := range values {
-		property, exists := schema.Properties[name]
-		if !exists {
-			return nil, fmt.Errorf("unknown argument %q", name)
-		}
-		switch property.Type {
-		case "string":
-			var decoded string
-			if err := json.Unmarshal(value, &decoded); err != nil {
-				return nil, fmt.Errorf("argument %q must be a string", name)
-			}
-		case "integer":
-			var decoded json.Number
-			if err := json.Unmarshal(value, &decoded); err != nil {
-				return nil, fmt.Errorf("argument %q must be an integer", name)
-			}
-			if _, err := decoded.Int64(); err != nil {
-				return nil, fmt.Errorf("argument %q must be an int64", name)
-			}
-		default:
-			return nil, fmt.Errorf("unsupported registry schema type %q", property.Type)
-		}
+	normalized, err := normalizeForSchema(values, &schema)
+	if err != nil {
+		return validatedArguments{}, err
 	}
-	return values, nil
+	normalizedValues, ok := normalized.(map[string]any)
+	if !ok {
+		return validatedArguments{}, errors.New("normalized arguments must be an object")
+	}
+	resolved, err := schema.Resolve(nil)
+	if err != nil {
+		return validatedArguments{}, fmt.Errorf("resolve registry schema: %w", err)
+	}
+	if err := resolved.Validate(normalizedValues); err != nil {
+		return validatedArguments{}, err
+	}
+	canonical, err := json.Marshal(normalizedValues)
+	if err != nil {
+		return validatedArguments{}, err
+	}
+	return validatedArguments{values: normalizedValues, canonical: string(canonical)}, nil
 }
 
-func canonicalArguments(arguments map[string]json.RawMessage) (string, error) {
-	data, err := json.Marshal(arguments)
-	return string(data), err
+func decodeStrictJSON(data []byte) (any, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.UseNumber()
+	value, err := decodeStrictValue(decoder)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := decoder.Token(); err != io.EOF {
+		if err == nil {
+			return nil, errors.New("multiple JSON values")
+		}
+		return nil, err
+	}
+	return value, nil
 }
 
-func stringArgument(arguments map[string]json.RawMessage, name string) (string, bool) {
+func decodeStrictValue(decoder *json.Decoder) (any, error) {
+	token, err := decoder.Token()
+	if err != nil {
+		return nil, err
+	}
+	delimiter, isDelimiter := token.(json.Delim)
+	if !isDelimiter {
+		return token, nil
+	}
+	switch delimiter {
+	case '{':
+		object := make(map[string]any)
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return nil, err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return nil, errors.New("object key must be a string")
+			}
+			if _, duplicate := object[key]; duplicate {
+				return nil, fmt.Errorf("duplicate object key %q", key)
+			}
+			value, err := decodeStrictValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			object[key] = value
+		}
+		if _, err := decoder.Token(); err != nil {
+			return nil, err
+		}
+		return object, nil
+	case '[':
+		array := make([]any, 0)
+		for decoder.More() {
+			value, err := decodeStrictValue(decoder)
+			if err != nil {
+				return nil, err
+			}
+			array = append(array, value)
+		}
+		if _, err := decoder.Token(); err != nil {
+			return nil, err
+		}
+		return array, nil
+	default:
+		return nil, errors.New("unexpected JSON delimiter")
+	}
+}
+
+func normalizeForSchema(value any, schema *jsonschema.Schema) (any, error) {
+	switch typed := value.(type) {
+	case json.Number:
+		return normalizeJSONNumber(typed, schema)
+	case map[string]any:
+		normalized := make(map[string]any, len(typed))
+		for key, child := range typed {
+			childSchema := schema.Properties[key]
+			if childSchema == nil {
+				childSchema = &jsonschema.Schema{}
+			}
+			value, err := normalizeForSchema(child, childSchema)
+			if err != nil {
+				return nil, err
+			}
+			normalized[key] = value
+		}
+		return normalized, nil
+	case []any:
+		normalized := make([]any, len(typed))
+		itemSchema := schema.Items
+		if itemSchema == nil {
+			itemSchema = &jsonschema.Schema{}
+		}
+		for index, child := range typed {
+			value, err := normalizeForSchema(child, itemSchema)
+			if err != nil {
+				return nil, err
+			}
+			normalized[index] = value
+		}
+		return normalized, nil
+	default:
+		return value, nil
+	}
+}
+
+func normalizeJSONNumber(number json.Number, schema *jsonschema.Schema) (any, error) {
+	if schemaAcceptsType(schema, "integer") {
+		value, _, err := big.ParseFloat(number.String(), 10, 256, big.ToNearestEven)
+		if err != nil {
+			return nil, err
+		}
+		integer, accuracy := value.Int(nil)
+		if accuracy != big.Exact || !integer.IsInt64() {
+			return nil, errors.New("number is not an exact int64")
+		}
+		return integer.Int64(), nil
+	}
+	value, err := number.Float64()
+	if err != nil {
+		return nil, err
+	}
+	return value, nil
+}
+
+func schemaAcceptsType(schema *jsonschema.Schema, want string) bool {
+	if schema.Type == want {
+		return true
+	}
+	for _, candidate := range schema.Types {
+		if candidate == want {
+			return true
+		}
+	}
+	return false
+}
+
+func stringArgument(arguments map[string]any, name string) (string, bool) {
 	value, exists := arguments[name]
 	if !exists {
 		return "", false
 	}
-	var decoded string
-	if err := json.Unmarshal(value, &decoded); err != nil {
-		return "", false
-	}
-	return decoded, true
+	decoded, ok := value.(string)
+	return decoded, ok
 }
 
-func int64Argument(arguments map[string]json.RawMessage, name string) (int64, bool) {
+func int64Argument(arguments map[string]any, name string) (int64, bool) {
 	value, exists := arguments[name]
 	if !exists {
 		return 0, false
 	}
-	var decoded json.Number
-	if err := json.Unmarshal(value, &decoded); err != nil {
-		return 0, false
-	}
-	integer, err := decoded.Int64()
-	return integer, err == nil
+	decoded, ok := value.(int64)
+	return decoded, ok
 }
 
 func canonicalScopes(scopes []string) []string {

@@ -104,7 +104,7 @@ func validateJSONStructure(data []byte) error {
 	if first != json.Delim('{') {
 		return errors.New("decode action plan: plan must be an object")
 	}
-	if err := validateObject(decoder, false); err != nil {
+	if err := validateObject(decoder, planObject, false); err != nil {
 		return err
 	}
 	if err := requireEOF(decoder); err != nil {
@@ -112,6 +112,14 @@ func validateJSONStructure(data []byte) error {
 	}
 	return nil
 }
+
+type objectKind uint8
+
+const (
+	genericObject objectKind = iota
+	planObject
+	stepObject
+)
 
 func validateValue(decoder *json.Decoder, inArguments bool) error {
 	token, err := decoder.Token()
@@ -124,7 +132,7 @@ func validateValue(decoder *json.Decoder, inArguments bool) error {
 	}
 	switch delimiter {
 	case '{':
-		return validateObject(decoder, inArguments)
+		return validateObject(decoder, genericObject, inArguments)
 	case '[':
 		for decoder.More() {
 			if err := validateValue(decoder, inArguments); err != nil {
@@ -140,7 +148,7 @@ func validateValue(decoder *json.Decoder, inArguments bool) error {
 	}
 }
 
-func validateObject(decoder *json.Decoder, inArguments bool) error {
+func validateObject(decoder *json.Decoder, kind objectKind, inArguments bool) error {
 	seen := make(map[string]struct{})
 	for decoder.More() {
 		token, err := decoder.Token()
@@ -155,10 +163,19 @@ func validateObject(decoder *json.Decoder, inArguments bool) error {
 			return fmt.Errorf("decode action plan: duplicate field %q", key)
 		}
 		seen[key] = struct{}{}
-		childInArguments := inArguments || key == "arguments"
+		if !exactMember(kind, key) {
+			return fmt.Errorf("decode action plan: unknown field %q", key)
+		}
 		if inArguments && forbiddenArgumentField(key) {
 			return fmt.Errorf("decode action plan: forbidden argument field %q", key)
 		}
+		if kind == planObject && key == "steps" {
+			if err := validateSteps(decoder); err != nil {
+				return err
+			}
+			continue
+		}
+		childInArguments := inArguments || kind == stepObject && key == "arguments"
 		if err := validateValue(decoder, childInArguments); err != nil {
 			return err
 		}
@@ -167,6 +184,48 @@ func validateObject(decoder *json.Decoder, inArguments bool) error {
 		return fmt.Errorf("decode action plan: %w", err)
 	}
 	return nil
+}
+
+func validateSteps(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return fmt.Errorf("decode action plan: %w", err)
+	}
+	if token != json.Delim('[') {
+		return errors.New("decode action plan: steps must be an array")
+	}
+	for decoder.More() {
+		token, err := decoder.Token()
+		if err != nil {
+			return fmt.Errorf("decode action plan: %w", err)
+		}
+		if token != json.Delim('{') {
+			return errors.New("decode action plan: every step must be an object")
+		}
+		if err := validateObject(decoder, stepObject, false); err != nil {
+			return err
+		}
+	}
+	if _, err := decoder.Token(); err != nil {
+		return fmt.Errorf("decode action plan: %w", err)
+	}
+	return nil
+}
+
+func exactMember(kind objectKind, key string) bool {
+	switch kind {
+	case planObject:
+		return key == "goal" || key == "policy_refs" || key == "steps"
+	case stepObject:
+		switch key {
+		case "id", "tool", "arguments", "depends_on", "risk", "success_condition", "approval_required":
+			return true
+		default:
+			return false
+		}
+	default:
+		return true
+	}
 }
 
 func forbiddenArgumentField(field string) bool {

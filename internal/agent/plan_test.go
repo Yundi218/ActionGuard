@@ -79,6 +79,26 @@ func TestDecodeActionPlanRejectsExecutableAndTrustedArgumentFieldsRecursively(t 
 	}
 }
 
+func TestDecodeActionPlanRejectsCaseVariantAliases(t *testing.T) {
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "plan alias", data: `{"Goal":"lookup","policy_refs":[],"steps":[]}`},
+		{name: "step alias", data: `{"goal":"lookup","policy_refs":[],"steps":[{"id":"s1","Tool":"get_order","arguments":{"order_id":"AG-1042"},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false}]}`},
+		{name: "mixed canonical and alias", data: `{"goal":"lookup","policy_refs":[],"steps":[{"id":"s1","tool":"get_order","Tool":"issue_refund","arguments":{"order_id":"AG-1042"},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false}]}`},
+		{name: "arguments alias hides recursive trusted metadata", data: `{"goal":"lookup","policy_refs":[],"steps":[{"id":"s1","tool":"get_order","Arguments":{"nested":{"User_ID":"attacker"},"order_id":"AG-1042"},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false}]}`},
+		{name: "mixed arguments alias hides recursive trusted metadata", data: `{"goal":"lookup","policy_refs":[],"steps":[{"id":"s1","tool":"get_order","arguments":{"order_id":"AG-1042"},"Arguments":{"nested":[{"Scopes":["attacker:write"]}]},"depends_on":[],"risk":"read","success_condition":"order.exists","approval_required":false}]}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := DecodeActionPlan([]byte(tt.data)); err == nil {
+				t.Fatal("DecodeActionPlan() error = nil")
+			}
+		})
+	}
+}
+
 func validReplacementPlanJSON() []byte {
 	return []byte(`{
 		"goal":"replace damaged item",

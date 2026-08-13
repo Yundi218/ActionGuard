@@ -29,6 +29,11 @@ type fakeFactReader struct {
 	calls  []factCall
 }
 
+type mutatingFactReader struct {
+	plan  *agent.ActionPlan
+	order commerce.Order
+}
+
 func (reader *fakeFactReader) GetOrder(_ context.Context, userID, orderID string) (commerce.Order, error) {
 	reader.calls = append(reader.calls, factCall{userID: userID, orderID: orderID})
 	if reader.err != nil {
@@ -39,6 +44,14 @@ func (reader *fakeFactReader) GetOrder(_ context.Context, userID, orderID string
 		return commerce.Order{}, commerce.ErrNotFound
 	}
 	return order, nil
+}
+
+func (reader *mutatingFactReader) GetOrder(_ context.Context, _, _ string) (commerce.Order, error) {
+	reader.plan.PolicyRefs[0] = "attacker:policy"
+	reader.plan.Steps[0].Arguments[2] = 'X'
+	reader.plan.Steps[1].DependsOn[0] = "attacker-step"
+	reader.plan.Steps[3].Tool = "issue_coupon"
+	return reader.order, nil
 }
 
 func TestVerifyAndSealAcceptsReplacementAndBindsPrivateContext(t *testing.T) {
@@ -81,6 +94,23 @@ func TestVerifyAndSealAcceptsReplacementAndBindsPrivateContext(t *testing.T) {
 	gotPlan := sealed.Plan()
 	if gotPlan.Goal != "replace damaged item" || gotPlan.PolicyRefs[0] != replacementCitationID || gotPlan.Steps[0].Tool != "get_order" || gotPlan.Steps[0].Arguments[0] != '{' || gotPlan.Steps[1].DependsOn[0] != "order" {
 		t.Fatalf("sealed plan mutated through caller data: %#v", gotPlan)
+	}
+}
+
+func TestVerifyAndSealSnapshotsPlanBeforeFactCallbacks(t *testing.T) {
+	plan, verificationContext, _ := validReplacementFixture()
+	want := clonePlan(plan)
+	reader := &mutatingFactReader{
+		plan:  &plan,
+		order: commerce.Order{ID: "AG-1042", UserID: "user-018", SKU: "SKU-RED-42", PaidAmountCents: 12000},
+	}
+
+	sealed, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+	if !result.Valid || len(result.Errors) != 0 {
+		t.Fatalf("result = %#v, want valid", result)
+	}
+	if got := sealed.Plan(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("sealed plan = %#v, want pre-callback snapshot %#v", got, want)
 	}
 }
 
@@ -139,6 +169,107 @@ func TestVerifierRejectsInvalidStructureAndContracts(t *testing.T) {
 			requireErrorCode(t, result, tt.code)
 			if sealed.UserID() != "" || len(sealed.Plan().Steps) != 0 {
 				t.Fatalf("invalid plan was sealed: %#v", sealed)
+			}
+		})
+	}
+}
+
+func TestVerifierBindsReplacementInventorySKU(t *testing.T) {
+	plan, verificationContext, reader := validReplacementFixture()
+	plan.Steps[2].Arguments = json.RawMessage(`{"sku":"SKU-BLUE-99"}`)
+
+	_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+	requireErrorCode(t, result, "sku_mismatch")
+}
+
+func TestVerifierRejectsSemanticallyDuplicateWriteArguments(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments json.RawMessage
+	}{
+		{name: "escaped string", arguments: json.RawMessage(`{"order_id":"AG-1042","sku":"SKU-RED-42","reason":"\u0064amaged"}`)},
+		{name: "reordered object keys", arguments: json.RawMessage(`{"reason":"damaged","sku":"SKU-RED-42","order_id":"AG-1042"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan, verificationContext, reader := duplicateReplacementFixture(tt.arguments)
+			_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+			requireErrorCode(t, result, "duplicate_action")
+		})
+	}
+
+	t.Run("equivalent integer representation", func(t *testing.T) {
+		plan := refundPlan(500, true, "refund.created")
+		duplicate := cloneStep(plan.Steps[1])
+		duplicate.ID = "refund-again"
+		duplicate.Arguments = json.RawMessage(`{"amount_cents":5e2,"order_id":"AG-1042"}`)
+		duplicate.DependsOn = []string{"order", "refund"}
+		plan.Steps = append(plan.Steps, duplicate)
+		verificationContext := Context{UserID: "user-018", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{refundEvidence()}}
+		reader := &fakeFactReader{orders: map[string]commerce.Order{"AG-1042": {ID: "AG-1042", UserID: "user-018", PaidAmountCents: 12000}}}
+
+		_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+		requireErrorCode(t, result, "duplicate_action")
+	})
+}
+
+func TestVerifierAppliesExactRegistryJSONSchema(t *testing.T) {
+	tests := []struct {
+		name      string
+		tool      string
+		arguments json.RawMessage
+	}{
+		{name: "null string", tool: "get_order", arguments: json.RawMessage(`{"order_id":null}`)},
+		{name: "duplicate object key", tool: "get_order", arguments: json.RawMessage(`{"order_id":"AG-1042","order_id":"AG-1042"}`)},
+		{name: "fractional integer", tool: "issue_coupon", arguments: json.RawMessage(`{"amount_cents":1500.5,"reason":"service recovery"}`)},
+		{name: "unknown property", tool: "check_inventory", arguments: json.RawMessage(`{"sku":"SKU-RED-42","warehouse":"attacker"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			plan, verificationContext, reader := singleToolFixture(tt.tool, tt.arguments)
+			_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+			requireErrorCode(t, result, "invalid_arguments")
+		})
+	}
+}
+
+func TestValidateArgumentsHonorsNumericAndNestedSchemaKeywords(t *testing.T) {
+	schema := json.RawMessage(`{
+		"type":"object",
+		"properties":{
+			"amount_cents":{"type":"integer","minimum":1,"maximum":2000},
+			"metadata":{
+				"type":"object",
+				"properties":{"reason":{"type":"string","minLength":3}},
+				"required":["reason"],
+				"additionalProperties":false
+			}
+		},
+		"required":["amount_cents","metadata"],
+		"additionalProperties":false
+	}`)
+	tests := []struct {
+		name      string
+		arguments string
+		valid     bool
+	}{
+		{name: "minimum boundary", arguments: `{"amount_cents":1,"metadata":{"reason":"abc"}}`, valid: true},
+		{name: "equivalent minimum", arguments: `{"amount_cents":1e0,"metadata":{"reason":"abc"}}`, valid: true},
+		{name: "below minimum", arguments: `{"amount_cents":0,"metadata":{"reason":"abc"}}`},
+		{name: "maximum boundary", arguments: `{"amount_cents":2000,"metadata":{"reason":"abc"}}`, valid: true},
+		{name: "above maximum", arguments: `{"amount_cents":2001,"metadata":{"reason":"abc"}}`},
+		{name: "nested minimum length", arguments: `{"amount_cents":1,"metadata":{"reason":"ab"}}`},
+		{name: "nested unknown property", arguments: `{"amount_cents":1,"metadata":{"reason":"abc","trusted":true}}`},
+		{name: "nested duplicate property", arguments: `{"amount_cents":1,"metadata":{"reason":"abc","reason":"def"}}`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := validateArguments(json.RawMessage(tt.arguments), schema)
+			if tt.valid && err != nil {
+				t.Fatalf("validateArguments() error = %v, want valid", err)
+			}
+			if !tt.valid && err == nil {
+				t.Fatal("validateArguments() error = nil, want schema rejection")
 			}
 		})
 	}
@@ -292,6 +423,58 @@ func validReplacementFixture() (agent.ActionPlan, Context, *fakeFactReader) {
 		"AG-1042": {ID: "AG-1042", UserID: "user-018", SKU: "SKU-RED-42", PaidAmountCents: 12000},
 	}}
 	return plan, verificationContext, reader
+}
+
+func duplicateReplacementFixture(arguments json.RawMessage) (agent.ActionPlan, Context, *fakeFactReader) {
+	plan, verificationContext, reader := validReplacementFixture()
+	duplicate := cloneStep(plan.Steps[3])
+	duplicate.ID = "replace-again"
+	duplicate.Arguments = arguments
+	plan.Steps = append(plan.Steps, duplicate)
+
+	capCents := int64(2000)
+	couponEvidence := baseEvidence("customer_care", "v1", "Coupon compensation", toolkit.HighRiskWrite)
+	couponEvidence.MaxCouponCents = &capCents
+	plan.PolicyRefs = append(plan.PolicyRefs, couponEvidence.CitationID)
+	verificationContext.Evidence = append(verificationContext.Evidence, couponEvidence)
+	verificationContext.Scopes = append(verificationContext.Scopes, "coupon:write")
+	plan.Steps = append(plan.Steps, agent.Step{
+		ID: "coupon", Tool: "issue_coupon", Arguments: json.RawMessage(`{"amount_cents":1000,"reason":"service recovery"}`),
+		DependsOn: []string{"replace", "replace-again"}, Risk: toolkit.HighRiskWrite,
+		SuccessCondition: "coupon.created", ApprovalRequired: true,
+	})
+	return plan, verificationContext, reader
+}
+
+func singleToolFixture(tool string, arguments json.RawMessage) (agent.ActionPlan, Context, *fakeFactReader) {
+	contract, ok := toolkit.LookupContract(tool)
+	if !ok {
+		panic("test fixture uses unknown tool " + tool)
+	}
+	plan := agent.ActionPlan{Goal: "validate arguments", Steps: []agent.Step{{
+		ID: "step", Tool: tool, Arguments: arguments, DependsOn: []string{}, Risk: contract.Risk,
+		SuccessCondition: firstSuccessCondition(tool), ApprovalRequired: contract.Risk == toolkit.HighRiskWrite,
+	}}}
+	verificationContext := Context{UserID: "user-018", Scopes: []string{contract.Scope}, Now: verifierTestNow}
+	reader := &fakeFactReader{orders: map[string]commerce.Order{"AG-1042": {ID: "AG-1042", UserID: "user-018", PaidAmountCents: 12000}}}
+	if policyID, needsEvidence := requiredPolicyByTool[tool]; needsEvidence {
+		requirement := policyRequirements[policyID]
+		evidence := baseEvidence(policyID, "v1", "Applicable rule", requirement.risk)
+		if policyID == "customer_care" {
+			capCents := int64(2000)
+			evidence.MaxCouponCents = &capCents
+		}
+		plan.PolicyRefs = []string{evidence.CitationID}
+		verificationContext.Evidence = []policy.Evidence{evidence}
+	}
+	return plan, verificationContext, reader
+}
+
+func firstSuccessCondition(tool string) string {
+	for condition := range successConditions[tool] {
+		return condition
+	}
+	return ""
 }
 
 func baseEvidence(policyID, version, section string, risk toolkit.Risk) policy.Evidence {
