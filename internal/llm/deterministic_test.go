@@ -94,6 +94,66 @@ func TestFixturePlannerRequiresOnlyContractsUsedByTheExample(t *testing.T) {
 	}
 }
 
+func TestFixturePlannerRejectsMismatchedCanonicalToolContracts(t *testing.T) {
+	canonical, ok := toolkit.LookupContract("get_order")
+	if !ok {
+		t.Fatal("get_order contract missing")
+	}
+	tests := []struct {
+		name   string
+		mutate func(*toolkit.Contract)
+	}{
+		{name: "scope", mutate: func(contract *toolkit.Contract) { contract.Scope = "shipment:read" }},
+		{name: "risk", mutate: func(contract *toolkit.Contract) { contract.Risk = toolkit.Write }},
+		{name: "idempotency requirement", mutate: func(contract *toolkit.Contract) { contract.RequiresIdempotencyKey = true }},
+		{name: "input schema", mutate: func(contract *toolkit.Contract) {
+			contract.InputSchema = json.RawMessage(`{"additionalProperties":false,"properties":{"order_id":{"type":"integer"}},"required":["order_id"],"type":"object"}`)
+		}},
+		{name: "description", mutate: func(contract *toolkit.Contract) { contract.Description = "forged description" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			forged := canonical
+			forged.InputSchema = append(json.RawMessage(nil), canonical.InputSchema...)
+			test.mutate(&forged)
+			_, err := NewFixturePlanner().Plan(context.Background(), PlanRequest{
+				UserMessage:   FixtureOrderLookupMessage,
+				ToolContracts: []toolkit.Contract{forged},
+			})
+			if !errors.Is(err, ErrUnsupportedFixture) {
+				t.Fatalf("error = %v, want ErrUnsupportedFixture", err)
+			}
+		})
+	}
+}
+
+func TestFixturePlannerAcceptsSemanticallyEquivalentToolSchemaJSON(t *testing.T) {
+	getOrder, ok := toolkit.LookupContract("get_order")
+	if !ok {
+		t.Fatal("get_order contract missing")
+	}
+	getOrder.InputSchema = json.RawMessage(`{
+		"type": "object",
+		"required": ["order_id"],
+		"properties": {
+			"order_id": {
+				"type": "string",
+				"description": "Order identifier"
+			}
+		},
+		"additionalProperties": false
+	}`)
+	plan, err := NewFixturePlanner().Plan(context.Background(), PlanRequest{
+		UserMessage: FixtureOrderLookupMessage, ToolContracts: []toolkit.Contract{getOrder},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.Steps) != 1 || plan.Steps[0].Tool != "get_order" {
+		t.Fatalf("plan = %#v", plan)
+	}
+}
+
 func TestFixturePlannerRepairReplansDocumentedFixtureFromStructuredErrors(t *testing.T) {
 	planner := NewFixturePlanner()
 	request := PlanRequest{UserMessage: FixtureOrderLookupMessage, ToolContracts: toolkit.Registry()}

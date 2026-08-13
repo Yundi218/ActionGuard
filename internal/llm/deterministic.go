@@ -1,6 +1,7 @@
 package llm
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -112,7 +113,7 @@ func hasFixtureContracts(contracts []toolkit.Contract, names ...string) bool {
 		required[name] = false
 	}
 	for _, contract := range contracts {
-		if _, exists := required[contract.Name]; exists {
+		if _, exists := required[contract.Name]; exists && matchesCanonicalContract(contract) {
 			required[contract.Name] = true
 		}
 	}
@@ -122,4 +123,24 @@ func hasFixtureContracts(contracts []toolkit.Contract, names ...string) bool {
 		}
 	}
 	return true
+}
+
+func matchesCanonicalContract(contract toolkit.Contract) bool {
+	canonical, ok := toolkit.LookupContract(contract.Name)
+	if !ok || contract.Name != canonical.Name || contract.Description != canonical.Description ||
+		contract.Risk != canonical.Risk || contract.Scope != canonical.Scope ||
+		contract.RequiresIdempotencyKey != canonical.RequiresIdempotencyKey {
+		return false
+	}
+	return schemasEquivalent(contract.InputSchema, canonical.InputSchema)
+}
+
+func schemasEquivalent(left, right json.RawMessage) bool {
+	var leftValue, rightValue any
+	if json.Unmarshal(left, &leftValue) != nil || json.Unmarshal(right, &rightValue) != nil {
+		return false
+	}
+	leftCanonical, leftErr := json.Marshal(leftValue)
+	rightCanonical, rightErr := json.Marshal(rightValue)
+	return leftErr == nil && rightErr == nil && bytes.Equal(leftCanonical, rightCanonical)
 }
