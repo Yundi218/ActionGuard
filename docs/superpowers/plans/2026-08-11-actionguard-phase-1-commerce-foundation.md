@@ -1253,6 +1253,8 @@ git commit -m "feat: expose commerce operations over MCP"
 - Create: `scripts/load-fixtures.sh`
 - Create: `internal/mcpserver/e2e_test.go`
 - Create: `.github/workflows/ci.yml`
+- Create: `Dockerfile`
+- Create: `.dockerignore`
 - Modify: `README.md`
 - Modify: `Makefile`
 - Modify: `deploy/docker-compose.yml`
@@ -1310,7 +1312,7 @@ fixtures:
 	DATABASE_URL=$${DATABASE_URL} bash scripts/load-fixtures.sh
 
 test-integration:
-	TEST_DATABASE_URL=$${DATABASE_URL} go test ./internal/database ./internal/commerce ./internal/mcpserver -v
+	TEST_DATABASE_URL=$${DATABASE_URL} go test -p 1 ./internal/database ./internal/commerce ./internal/mcpserver -v
 
 demo-up:
 	docker compose -f deploy/docker-compose.yml up --build
@@ -1379,7 +1381,7 @@ Run: `make test-integration`
 
 Expected: `TestDamagedItemReplacementAndCouponFlow` PASS and no duplicate replacement rows.
 
-Run: `go test ./...`
+Run: `go test -p 1 ./...`
 
 Expected: PASS.
 
@@ -1387,7 +1389,15 @@ Run: `go vet ./...`
 
 Expected: exit code 0.
 
-- [ ] **Step 5: Add deterministic GitHub Actions CI**
+- [ ] **Step 5: Add a reproducible MCP container and deterministic GitHub Actions CI**
+
+Create a multi-stage `Dockerfile` that builds `./cmd/commerce-mcp` with Go 1.24
+and runs the resulting binary in a minimal non-root runtime image. Add a
+`.dockerignore` that excludes Git metadata, worktrees, local environment files,
+and build artifacts. Extend `deploy/docker-compose.yml` with a `commerce-mcp`
+service that builds from the repository root, waits for PostgreSQL health,
+uses the Compose PostgreSQL URL, binds port `8081`, and supplies the synthetic
+development gateway token. Do not bake credentials into the image.
 
 Create `.github/workflows/ci.yml`:
 
@@ -1424,7 +1434,7 @@ jobs:
         with:
           go-version: "1.24.x"
           cache: true
-      - run: go test ./...
+      - run: go test -p 1 ./...
       - run: go vet ./...
 ```
 
