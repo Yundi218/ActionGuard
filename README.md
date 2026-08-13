@@ -4,7 +4,7 @@
 
 ActionGuard 是一个面向零售售后场景的策略约束型业务执行项目。它关注的不是让模型“像客服一样回答”，而是让系统能在明确的业务规则、身份和权限边界内可靠地完成订单查询、退货、换货、退款和优惠补偿等动作。
 
-> **Current status:** Phase 1 implements the simulator and MCP tool layer; LLM orchestration is not implemented yet.
+> **Current status:** Phase 2 implements policy retrieval, typed planning, deterministic verification, and bounded synchronous execution. Temporal durability, approval execution, evaluation, and UI remain roadmap.
 
 ## Why ActionGuard
 
@@ -17,19 +17,20 @@ ActionGuard 是一个面向零售售后场景的策略约束型业务执行项�
 - 将物流备注中的恶意文本当成系统指令。
 - 缺少数据库级断言，只能依靠单次 Demo 判断效果。
 
-ActionGuard 的长期方向是让 LLM 负责语义判断，让确定性 Runtime 负责执行，让 Verifier 负责风险边界，并以业务数据库作为最终事实。Phase 1 先固定最底层的可执行合同：确定性 commerce service、PostgreSQL store 和 streamable HTTP MCP gateway。
+ActionGuard 的长期方向是让 LLM 负责语义判断，让确定性 Runtime 负责执行，让 Verifier 负责风险边界，并以业务数据库作为最终事实。Phase 2 在 Phase 1 的 commerce service、PostgreSQL store 和 streamable HTTP MCP gateway 之上，加入了策略检索、类型化计划与确定性校验。
 
 ## Implemented Architecture
 
 ```mermaid
 flowchart LR
-    C["Official MCP client"] -->|"Streamable HTTP"| G["Trusted-context MCP gateway"]
+    U["Session HTTP API"] --> O["Policy retrieval + planner + verifier"]
+    O -->|"Official MCP client"| G["Trusted-context MCP gateway"]
     G --> S["Deterministic commerce service"]
     S --> P["PostgreSQL 16 + pgvector image"]
     F["Synthetic SQL fixtures"] --> P
 ```
 
-身份、Scope、run/step 元数据和幂等键通过受信任 HTTP headers 注入，不属于 LLM 可生成的 Tool arguments。详细边界和后续架构见 [technical design](docs/superpowers/specs/2026-08-11-actionguard-design.md)，当前 Phase 1 的验收步骤见 [commerce foundation implementation plan](docs/superpowers/plans/2026-08-11-actionguard-phase-1-commerce-foundation.md)。
+身份、Scope、run/step 元数据和幂等键通过受信任 HTTP headers 注入，不属于 LLM 可生成的 Tool arguments。Session API 的调用方身份只来自服务端 Bearer 凭证；策略证据以版本化 citation 绑定到类型化计划，Verifier 在任何 MCP 调用前进行 Scope、所有权、结构和策略适用性校验。详细边界见 [technical design](docs/superpowers/specs/2026-08-11-actionguard-design.md)。
 
 ## MCP Tools
 
@@ -57,10 +58,12 @@ cp .env.example .env
 set -a; source .env; set +a
 make db-up
 make fixtures
+make policies
 make mcp
+make api
 ```
 
-`make fixtures` applies the public commerce migration and resets the synthetic fixture dataset together in one PostgreSQL transaction, so it works against a fresh database and remains safe to repeat. The MCP endpoint listens on `http://localhost:8081/mcp`.
+`make fixtures` applies the public commerce migration and resets the synthetic fixture dataset together in one PostgreSQL transaction. `make policies` runs ordered migrations and imports the three embedded public policy files. The MCP endpoint listens on `http://localhost:8081/mcp`; the Session API listens on `http://localhost:8080`.
 
 To build and run the seeded demo entirely with Compose, use:
 
@@ -68,7 +71,9 @@ To build and run the seeded demo entirely with Compose, use:
 make demo-up
 ```
 
-Compose waits for PostgreSQL health, runs a one-shot transactional fixture loader, and starts the MCP service only after loading succeeds. The environment contains only synthetic local-development values; it does not contain real service or user credentials.
+Compose waits for PostgreSQL health, runs a one-shot transactional fixture loader, then imports embedded policies before starting the MCP service; API startup waits for MCP health. The environment contains only synthetic local-development values; it does not contain real service or user credentials.
+
+The default is deterministic: `LLM_PROVIDER=deterministic` and `EMBEDDING_PROVIDER=deterministic`. This is a reproducible fixture planner and embedder, not a claim about model quality. To opt into OpenAI-compatible providers, explicitly set `LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_EMBEDDING_MODEL`; `OPENAI_BASE_URL` is optional. Missing required OpenAI values fail startup instead of falling back.
 
 ## Verification
 
@@ -86,14 +91,14 @@ Run all packages serially against the local synthetic database to avoid shared-d
 TEST_DATABASE_URL="$DATABASE_URL" go test -p 1 ./...
 ```
 
-Run the named streamable HTTP MCP scenario directly:
+Run the named policy-constrained Session API scenario directly:
 
 ```bash
-TEST_DATABASE_URL="$DATABASE_URL" go test -p 1 ./internal/mcpserver \
-  -run '^TestDamagedItemReplacementAndCouponFlow$' -count=1 -v
+TEST_DATABASE_URL="$DATABASE_URL" go test -p 1 ./internal/orchestrator \
+  -run '^TestPolicyConstrainedReplacementFlow$' -count=1 -v
 ```
 
-The E2E test migrates PostgreSQL, reloads fixtures, starts a real `httptest` MCP server, uses the official MCP client, and verifies replacement/coupon side effects, idempotent replay, inventory reservation, missing-Scope rejection, cross-user rejection, exact tool discovery, and untrusted shipment-text containment.
+The E2E test migrates PostgreSQL, reloads fixtures and embedded policies, starts a real streamable HTTP MCP server with trusted-context middleware, calls the Session API, and verifies filtered policy evidence, typed-plan validation, ownership and Scope rejection, bounded replacement execution, high-risk waiting behavior, and untrusted shipment-text containment. The full claim-to-evidence map is in [Phase 2 evidence](docs/phase-2-evidence.md).
 
 ## Security And Data
 
@@ -110,7 +115,7 @@ The E2E test migrates PostgreSQL, reloads fixtures, starts a real `httptest` MCP
 | Project definition | Complete | Scope, non-goals, and interview narrative |
 | Technical design | Complete | [ActionGuard technical design](docs/superpowers/specs/2026-08-11-actionguard-design.md) |
 | Phase 1 commerce foundation | Implemented | PostgreSQL simulator, eight MCP tools, fixtures, E2E test, container, and CI workflow |
-| Phase 2 policy and planning | Roadmap | Policy RAG, Typed Planner, and Plan Verifier |
+| Phase 2 policy and planning | Implemented | Policy retrieval, typed planner, deterministic verifier, Session API, and bounded synchronous execution |
 | Phase 3 durable execution | Roadmap | Temporal runtime, approval, retry, and compensation |
 | Phase 4 observability and security | Roadmap | Trace, replay, fault injection, and security controls |
 | Phase 5 evaluation | Roadmap | Evaluation harness and ablation experiments |
@@ -120,7 +125,7 @@ The roadmap is described in the [implementation plan](docs/superpowers/plans/202
 
 ## Scope Honesty
 
-ActionGuard does not yet include LLM orchestration, Policy RAG, a Typed Planner, a Plan Verifier, Temporal workflows, an evaluation harness, or a UI. It publishes no performance, success-rate, or production-usage claims. Those results belong here only after the corresponding implementation and reproducible evidence exist.
+Phase 2 does not include Temporal durability, approval execution, post-condition checks, retries, compensation, an evaluation harness, or a UI. It publishes no model-quality, latency, cost, success-rate, or production-usage claims. Those results belong here only after the corresponding implementation and reproducible evidence exist.
 
 ## Design References
 

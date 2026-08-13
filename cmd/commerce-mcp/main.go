@@ -55,6 +55,9 @@ func newMCPMux(token string, transport http.Handler) http.Handler {
 	limitedTransport := http.MaxBytesHandler(transport, maxMCPRequestBodyBytes)
 	handler := mcpserver.TrustedContextMiddleware(token, limitRequestBody(maxMCPRequestBodyBytes, limitedTransport))
 	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("ok\n"))
+	})
 	mux.Handle("/mcp", handler)
 	return mux
 }

@@ -4,11 +4,15 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /out/commerce-mcp ./cmd/commerce-mcp
+RUN mkdir -p /app && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/api ./cmd/api && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/commerce-mcp ./cmd/commerce-mcp && \
+    CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o /app/policy-import ./cmd/policy-import
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM alpine:3.21
 
-COPY --from=build --chown=nonroot:nonroot /out/commerce-mcp /commerce-mcp
-EXPOSE 8081
-USER nonroot:nonroot
-ENTRYPOINT ["/commerce-mcp"]
+RUN apk add --no-cache ca-certificates && \
+    addgroup -S actionguard && adduser -S -G actionguard actionguard
+COPY --from=build --chown=actionguard:actionguard /app /app
+EXPOSE 8080 8081
+USER actionguard:actionguard

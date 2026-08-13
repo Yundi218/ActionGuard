@@ -166,6 +166,13 @@ func TestPolicyConstrainedReplacementFlow(t *testing.T) {
 
 	prepareE2EDatabase(t, ctx, pool)
 	commerceService := commerce.NewServiceWithClock(commerce.NewPostgresStore(pool), func() time.Time { return e2eNow })
+	ownedOrder, err := commerceService.ResolveOrderContext(ctx, "user_018", "AG-1042")
+	if err != nil {
+		t.Fatalf("resolve owned order context: %v", err)
+	}
+	if ownedOrder.ProductCategory != "electronics" {
+		t.Fatalf("owned order product category = %q, want electronics", ownedOrder.ProductCategory)
+	}
 
 	mcpServer := mcpserver.New(commerceService)
 	streamableHandler := mcp.NewStreamableHTTPHandler(

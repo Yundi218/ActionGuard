@@ -36,14 +36,75 @@ services:
     build:
       context: ..
       dockerfile: Dockerfile
+    command: ["/app/commerce-mcp"]
     depends_on:
-      postgres:
-        condition: service_healthy
-      fixture-loader:
+      policy-import:
         condition: service_completed_successfully
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
       MCP_ADDR: :8081
-      MCP_GATEWAY_TOKEN: local-dev-gateway-token
+      MCP_URL: http://commerce-mcp:8081/mcp
+      MCP_GATEWAY_TOKEN: actionguard-demo-gateway-token
+      DEMO_FULL_TOKEN: actionguard-demo-full-token
+      DEMO_READ_ONLY_TOKEN: actionguard-demo-read-only-token
+      DEMO_USER_999_TOKEN: actionguard-demo-user-999-token
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
     ports:
       - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8081/healthz >/dev/null"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  policy-import:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/app/policy-import"]
+    depends_on:
+      fixture-loader:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
+      MCP_URL: http://commerce-mcp:8081/mcp
+      MCP_GATEWAY_TOKEN: actionguard-demo-gateway-token
+      DEMO_FULL_TOKEN: actionguard-demo-full-token
+      DEMO_READ_ONLY_TOKEN: actionguard-demo-read-only-token
+      DEMO_USER_999_TOKEN: actionguard-demo-user-999-token
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["/app/api"]
+    depends_on:
+      commerce-mcp:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
+      API_ADDR: :8080
+      MCP_URL: http://commerce-mcp:8081/mcp
+      MCP_GATEWAY_TOKEN: actionguard-demo-gateway-token
+      DEMO_FULL_TOKEN: actionguard-demo-full-token
+      DEMO_READ_ONLY_TOKEN: actionguard-demo-read-only-token
+      DEMO_USER_999_TOKEN: actionguard-demo-user-999-token
+      LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-}
+      OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}
+    ports:
+      - "8080:8080"

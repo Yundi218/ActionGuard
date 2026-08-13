@@ -98,11 +98,11 @@ func TestComposeSeedsDatabaseBeforeStartingMCP(t *testing.T) {
 	compose := string(contents)
 
 	loaderStart := strings.Index(compose, "  fixture-loader:")
-	mcpService := strings.Index(compose, "  commerce-mcp:")
-	if loaderStart < 0 || mcpService < 0 || loaderStart > mcpService {
-		t.Fatalf("fixture-loader must be defined before commerce-mcp")
+	policyImport := strings.Index(compose, "  policy-import:")
+	if loaderStart < 0 || policyImport < 0 {
+		t.Fatal("fixture-loader and policy-import services are required")
 	}
-	loaderBlock := compose[loaderStart:mcpService]
+	loaderBlock := compose[loaderStart:policyImport]
 	requiredLoaderFragments := []string{
 		"image: pgvector/pgvector:pg16",
 		"condition: service_healthy",
@@ -122,9 +122,116 @@ func TestComposeSeedsDatabaseBeforeStartingMCP(t *testing.T) {
 	if migration < 0 || fixture < 0 || migration > fixture {
 		t.Fatalf("fixture-loader must run migration before fixtures")
 	}
-	mcpBlock := compose[mcpService:]
-	if !strings.Contains(mcpBlock, "fixture-loader:") || !strings.Contains(mcpBlock, "condition: service_completed_successfully") {
-		t.Fatalf("commerce-mcp must wait for fixture-loader completion")
+	policyBlock := compose[policyImport:]
+	if !strings.Contains(policyBlock, "fixture-loader:") || !strings.Contains(policyBlock, "condition: service_completed_successfully") {
+		t.Fatalf("policy-import must wait for fixture-loader completion")
+	}
+}
+
+func TestDockerfileBuildsAllPhaseTwoCommandsWithoutFixedEntrypoint(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join(repositoryRoot(t), "Dockerfile"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dockerfile := string(contents)
+	for _, fragment := range []string{
+		"-o /app/api ./cmd/api",
+		"-o /app/commerce-mcp ./cmd/commerce-mcp",
+		"-o /app/policy-import ./cmd/policy-import",
+		"apk add --no-cache ca-certificates",
+		"COPY --from=build",
+		"/app /app",
+		"EXPOSE 8080 8081",
+	} {
+		if !strings.Contains(dockerfile, fragment) {
+			t.Errorf("Dockerfile missing %q", fragment)
+		}
+	}
+	if strings.Contains(dockerfile, "ENTRYPOINT") {
+		t.Fatal("Dockerfile must not select a fixed entrypoint; Compose selects the command")
+	}
+}
+
+func TestComposeStartsDeterministicPhaseTwoTopology(t *testing.T) {
+	contents, err := os.ReadFile(filepath.Join(repositoryRoot(t), "deploy", "docker-compose.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	compose := string(contents)
+	postgres := serviceBlock(t, compose, "postgres")
+	fixtureLoader := serviceBlock(t, compose, "fixture-loader")
+	policyImport := serviceBlock(t, compose, "policy-import")
+	mcp := serviceBlock(t, compose, "commerce-mcp")
+	api := serviceBlock(t, compose, "api")
+
+	for _, fragment := range []string{"healthcheck:", "pg_isready -U postgres -d actionguard"} {
+		if !strings.Contains(postgres, fragment) {
+			t.Errorf("postgres missing %q", fragment)
+		}
+	}
+	requireFragments(t, fixtureLoader, "postgres:", "condition: service_healthy")
+	requireFragments(t, policyImport,
+		"command: [\"/app/policy-import\"]",
+		"fixture-loader:",
+		"condition: service_completed_successfully",
+		"LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}",
+		"EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}",
+		"OPENAI_API_KEY: ${OPENAI_API_KEY:-}",
+		"OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}",
+	)
+	requireFragments(t, mcp,
+		"command: [\"/app/commerce-mcp\"]",
+		"policy-import:",
+		"condition: service_completed_successfully",
+		"MCP_ADDR: :8081",
+		"MCP_GATEWAY_TOKEN: actionguard-demo-gateway-token",
+		"healthcheck:",
+	)
+	requireFragments(t, api,
+		"command: [\"/app/api\"]",
+		"commerce-mcp:",
+		"condition: service_healthy",
+		"MCP_URL: http://commerce-mcp:8081/mcp",
+		"LLM_PROVIDER: ${LLM_PROVIDER:-deterministic}",
+		"EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-deterministic}",
+		"OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com}",
+		"OPENAI_API_KEY: ${OPENAI_API_KEY:-}",
+		"OPENAI_MODEL: ${OPENAI_MODEL:-}",
+		"OPENAI_EMBEDDING_MODEL: ${OPENAI_EMBEDDING_MODEL:-}",
+		"DEMO_FULL_TOKEN: actionguard-demo-full-token",
+		"DEMO_READ_ONLY_TOKEN: actionguard-demo-read-only-token",
+		"DEMO_USER_999_TOKEN: actionguard-demo-user-999-token",
+	)
+}
+
+func serviceBlock(t *testing.T, compose, service string) string {
+	t.Helper()
+	var block []string
+	found := false
+	for _, line := range strings.Split(compose, "\n") {
+		isService := strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && strings.HasSuffix(line, ":")
+		if isService {
+			if found {
+				break
+			}
+			found = line == "  "+service+":"
+		}
+		if found {
+			block = append(block, line)
+		}
+	}
+	if !found {
+		t.Fatalf("Compose service %q is missing", service)
+	}
+	return strings.Join(block, "\n")
+}
+
+func requireFragments(t *testing.T, contents string, fragments ...string) {
+	t.Helper()
+	for _, fragment := range fragments {
+		if !strings.Contains(contents, fragment) {
+			t.Errorf("service configuration missing %q", fragment)
+		}
 	}
 }
 

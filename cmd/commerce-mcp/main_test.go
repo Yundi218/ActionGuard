@@ -33,6 +33,19 @@ func TestNewCommerceMCPServerWiresSharedTimeoutsAndHandler(t *testing.T) {
 	}
 }
 
+func TestMCPMuxServesUnauthenticatedHealthCheck(t *testing.T) {
+	response := httptest.NewRecorder()
+
+	newMCPMux("gateway-secret", http.NotFoundHandler()).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+
+	if response.Code != http.StatusOK {
+		t.Fatalf("health status = %d, want %d", response.Code, http.StatusOK)
+	}
+	if got := strings.TrimSpace(response.Body.String()); got != "ok" {
+		t.Fatalf("health body = %q, want ok", got)
+	}
+}
+
 func TestMainDelegatesToCommerceMCPServerFactory(t *testing.T) {
 	source, err := os.ReadFile("main.go")
 	if err != nil {

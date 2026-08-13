@@ -31,5 +31,6 @@ jobs:
           go-version: "1.24.x"
           cache: true
       - run: go mod verify
-      - run: go test -p 1 ./...
+      - run: go test -p 1 ./... -count=1
+      - run: go test -race -p 1 ./... -count=1
       - run: go vet ./...
