@@ -12,3 +12,17 @@ services:
       interval: 2s
       timeout: 2s
       retries: 20
+
+  commerce-mcp:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
+      MCP_ADDR: :8081
+      MCP_GATEWAY_TOKEN: local-dev-gateway-token
+    ports:
+      - "8081:8081"
