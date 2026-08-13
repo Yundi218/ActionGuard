@@ -134,8 +134,8 @@ git commit -m "feat: add policy planning persistence"
 - Create: `internal/policy/importer.go`
 - Create: `internal/policy/importer_test.go`
 - Create: `internal/policy/postgres_store.go`
-- Create: `internal/policyassets/embed.go`
-- Create: `internal/policyassets/embed_test.go`
+- Create: `policies/embed.go` (package name `policyassets`)
+- Create: `policies/embed_test.go` (package name `policyassets`)
 - Create: `policies/damaged-goods-v3.md`
 - Create: `policies/refunds-v2.md`
 - Create: `policies/customer-care-v1.md`
@@ -212,7 +212,7 @@ func (i *Importer) Import(ctx context.Context, sourceName string, markdown []byt
 
 Chunk by Markdown `##` sections and then deterministic paragraph groups capped at 1200 bytes with 150-byte overlap. Preserve UTF-8 boundaries. `DeterministicEmbedder` tokenizes lowercase alphanumeric terms, hashes each token into a dimension and sign, then L2 normalizes; it is a reproducible test/demo baseline, not a semantic-model claim.
 
-`internal/policyassets` uses `go:embed` to package exactly the three public policies and exposes them in lexical filename order. The import command and container demo consume these embedded bytes; no runtime policy volume is required.
+The root `policies` Go package is named `policyassets`; colocating `embed.go` with the Markdown files satisfies Go's rule that `go:embed` cannot traverse parent directories. It packages exactly the three public policies and exposes them in lexical filename order. The import command and container demo consume these embedded bytes; no runtime policy volume is required.
 
 - [ ] **Step 4: Add the three synthetic policies and pass tests**
 
@@ -225,7 +225,7 @@ TEST_DATABASE_URL="$TEST_DATABASE_URL" go test -p 1 ./internal/policy -count=1
 - [ ] **Step 5: Commit**
 
 ```bash
-git add internal/policy internal/policyassets policies
+git add internal/policy policies
 git commit -m "feat: import versioned policy evidence"
 ```
 
