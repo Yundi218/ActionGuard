@@ -661,7 +661,7 @@ func replayedResult(ctx context.Context, tx pgx.Tx, operation, key string) (Writ
 }
 ```
 
-For a new write, lock the order or inventory row with `FOR UPDATE`, insert the resource, update affected balances or inventory, insert `idempotency_records`, and commit. Return `ErrIdempotencyKey` before opening a transaction when the key is empty.
+At the start of every write transaction, acquire `pg_advisory_xact_lock(hashtextextended(operation || ':' || idempotency_key, 0))` before checking `idempotency_records`. This serializes concurrent submissions of the same operation and key. For a new write, lock the order or inventory row with `FOR UPDATE`, insert the resource, update affected balances or inventory, insert `idempotency_records`, and commit. Return `ErrIdempotencyKey` before opening a transaction when the key is empty.
 
 Define the concrete store and constructor exactly as:
 
@@ -793,7 +793,7 @@ func (s *Service) GetShipment(context.Context, string, string) (Shipment, error)
 func (s *Service) CheckInventory(context.Context, string) (Inventory, error)
 func (s *Service) CheckEligibility(context.Context, string, string) (Eligibility, error)
 func (s *Service) CreateReturn(context.Context, string, string, string, string) (WriteResult, error)
-func (s *Service) CreateReplacement(context.Context, string, string, string, string) (WriteResult, error)
+func (s *Service) CreateReplacement(context.Context, string, string, string, string, string) (WriteResult, error)
 func (s *Service) IssueRefund(context.Context, string, string, int64, string) (WriteResult, error)
 func (s *Service) IssueCoupon(context.Context, string, int64, string, string) (WriteResult, error)
 ```
@@ -1298,7 +1298,7 @@ demo-up:
 
 Create `internal/mcpserver/e2e_test.go`. The test must:
 
-1. Open `TEST_DATABASE_URL`, migrate, and reload fixtures.
+1. Open `TEST_DATABASE_URL`, migrate, load `fixtures/commerce.sql` using `os.ReadFile("../../fixtures/commerce.sql")`, and execute it before the test flow.
 2. Start `mcpserver.New` with a real `PostgresStore` behind an `httptest.Server`, stateless streamable MCP handler, and `TrustedContextMiddleware`.
 3. Call `get_order`, `check_eligibility`, `check_inventory`, `create_replacement`, and `issue_coupon` in order.
 4. Repeat `create_replacement` with the same idempotency key.
