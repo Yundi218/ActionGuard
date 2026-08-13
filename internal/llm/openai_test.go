@@ -214,6 +214,91 @@ func TestOpenAIPlannerRetriesTransientStatusesAtMostTwice(t *testing.T) {
 	}
 }
 
+func TestOpenAIPlannerRetriesTruncatedRetryableStatusBodies(t *testing.T) {
+	for _, status := range []int{http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+				if attempts.Add(1) == 1 {
+					writeTruncatedResponse(writer, status)
+					return
+				}
+				writePlanResponse(t, writer, lookupPlanJSON())
+			}))
+			t.Cleanup(server.Close)
+
+			var backoffs atomic.Int32
+			planner := newTestPlanner(t, server.URL, nil, func(context.Context, int) error {
+				backoffs.Add(1)
+				return nil
+			})
+			plan, err := planner.Plan(context.Background(), PlanRequest{
+				UserMessage: FixtureOrderLookupMessage, ToolContracts: toolkit.Registry(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if plan.Goal != "look up order" {
+				t.Fatalf("plan goal = %q", plan.Goal)
+			}
+			if attempts.Load() != 2 || backoffs.Load() != 1 {
+				t.Fatalf("attempts/backoffs = %d/%d, want 2/1", attempts.Load(), backoffs.Load())
+			}
+		})
+	}
+}
+
+func TestOpenAIPlannerExhaustsTruncatedRetryableStatusBodies(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		writeTruncatedResponse(writer, http.StatusInternalServerError)
+	}))
+	t.Cleanup(server.Close)
+
+	var backoffs atomic.Int32
+	planner := newTestPlanner(t, server.URL, nil, func(context.Context, int) error {
+		backoffs.Add(1)
+		return nil
+	})
+	_, err := planner.Plan(context.Background(), PlanRequest{
+		UserMessage: testUserMessage, ToolContracts: toolkit.Registry(),
+	})
+	if !errors.Is(err, ErrRequestFailed) {
+		t.Fatalf("error = %v, want ErrRequestFailed", err)
+	}
+	if attempts.Load() != 3 || backoffs.Load() != 2 {
+		t.Fatalf("attempts/backoffs = %d/%d, want 3/2", attempts.Load(), backoffs.Load())
+	}
+	assertSanitizedError(t, err)
+}
+
+func TestOpenAIPlannerResponseTooLargePrecedesRetryableStatus(t *testing.T) {
+	var attempts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		writer.WriteHeader(http.StatusInternalServerError)
+		_, _ = writer.Write([]byte(strings.Repeat("body-secret", maxResponseBodyBytes/len("body-secret")+2)))
+	}))
+	t.Cleanup(server.Close)
+
+	var backoffs atomic.Int32
+	planner := newTestPlanner(t, server.URL, nil, func(context.Context, int) error {
+		backoffs.Add(1)
+		return nil
+	})
+	_, err := planner.Plan(context.Background(), PlanRequest{
+		UserMessage: testUserMessage, ToolContracts: toolkit.Registry(),
+	})
+	if !errors.Is(err, ErrResponseTooLarge) {
+		t.Fatalf("error = %v, want ErrResponseTooLarge", err)
+	}
+	if attempts.Load() != 1 || backoffs.Load() != 0 {
+		t.Fatalf("attempts/backoffs = %d/%d, want 1/0", attempts.Load(), backoffs.Load())
+	}
+	assertSanitizedError(t, err)
+}
+
 func TestOpenAIPlannerRetriesAttemptTimeoutAtMostTwice(t *testing.T) {
 	var attempts atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
@@ -565,6 +650,12 @@ func writePlanResponse(t *testing.T, writer http.ResponseWriter, planJSON []byte
 	if err := json.NewEncoder(writer).Encode(response); err != nil {
 		t.Errorf("encode response: %v", err)
 	}
+}
+
+func writeTruncatedResponse(writer http.ResponseWriter, status int) {
+	writer.Header().Set("Content-Length", "100")
+	writer.WriteHeader(status)
+	_, _ = writer.Write([]byte("body-secret truncated"))
 }
 
 func lookupPlanJSON() []byte {

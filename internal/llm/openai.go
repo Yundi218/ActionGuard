@@ -415,6 +415,15 @@ func (client *openAIHTTPClient) postJSON(ctx context.Context, endpoint string, p
 		if errors.Is(readErr, ErrResponseTooLarge) {
 			return nil, ErrResponseTooLarge
 		}
+		if retryableStatus(response.StatusCode) {
+			if attempt < maxRetries {
+				if err := client.waitBackoff(ctx, attempt+1); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			return nil, ErrRequestFailed
+		}
 		if readErr != nil || closeErr != nil {
 			if (timedOut || isTimeout(readErr)) && attempt < maxRetries {
 				if err := client.waitBackoff(ctx, attempt+1); err != nil {
@@ -426,12 +435,6 @@ func (client *openAIHTTPClient) postJSON(ctx context.Context, endpoint string, p
 		}
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
 			return body, nil
-		}
-		if retryableStatus(response.StatusCode) && attempt < maxRetries {
-			if err := client.waitBackoff(ctx, attempt+1); err != nil {
-				return nil, err
-			}
-			continue
 		}
 		return nil, ErrRequestFailed
 	}
