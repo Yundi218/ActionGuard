@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -26,11 +27,14 @@ const (
 )
 
 type Context struct {
-	UserID   string
-	Scopes   []string
-	Now      time.Time
-	Evidence []policy.Evidence
+	UserID          string
+	ResolvedOrderID string
+	Scopes          []string
+	Now             time.Time
+	Evidence        []policy.Evidence
 }
+
+var safeOrderIDPattern = regexp.MustCompile(`^AG-[0-9]{4,}$`)
 
 type FactReader interface {
 	GetOrder(context.Context, string, string) (commerce.Order, error)
@@ -361,7 +365,8 @@ func (state *verificationState) validateFactsAndAmounts(ctx context.Context, ver
 		order commerce.Order
 		err   error
 	}
-	facts := make(map[string]factResult)
+	orderBound := false
+	trustedOrderMatches := true
 	firstOrderID := ""
 	for index, step := range state.plan.Steps {
 		arguments := state.parsedArguments[index]
@@ -370,21 +375,45 @@ func (state *verificationState) validateFactsAndAmounts(ctx context.Context, ver
 		}
 		orderID, hasOrder := stringArgument(arguments, "order_id")
 		if hasOrder {
+			orderBound = true
 			if firstOrderID == "" {
 				firstOrderID = orderID
 			} else if orderID != firstOrderID {
 				state.add("order_mismatch", step.ID, "arguments.order_id", "all order-bound steps must target the same order")
 			}
-			fact, loaded := facts[orderID]
-			if !loaded {
-				if verifier == nil || verifier.facts == nil {
-					fact.err = errors.New("fact reader unavailable")
-				} else {
-					fact.order, fact.err = verifier.facts.GetOrder(ctx, state.context.UserID, orderID)
-				}
-				facts[orderID] = fact
+			if orderID != state.context.ResolvedOrderID {
+				trustedOrderMatches = false
+				state.add("resolved_order_mismatch", step.ID, "arguments.order_id", "step order must exactly match the trusted resolved order")
 			}
-			if fact.err != nil || fact.order.ID != orderID {
+		}
+	}
+
+	if !orderBound {
+		state.validateOrderlessAmounts()
+		return
+	}
+	if !safeOrderIDPattern.MatchString(state.context.ResolvedOrderID) {
+		state.add("invalid_context", "", "resolved_order_id", "a safe trusted resolved order id is required for order-bound plans")
+		return
+	}
+	if !trustedOrderMatches {
+		return
+	}
+
+	var fact factResult
+	if verifier == nil || verifier.facts == nil {
+		fact.err = errors.New("fact reader unavailable")
+	} else {
+		fact.order, fact.err = verifier.facts.GetOrder(ctx, state.context.UserID, state.context.ResolvedOrderID)
+	}
+	for index, step := range state.plan.Steps {
+		arguments := state.parsedArguments[index]
+		if arguments == nil {
+			continue
+		}
+		orderID, hasOrder := stringArgument(arguments, "order_id")
+		if hasOrder {
+			if fact.err != nil || fact.order.ID != state.context.ResolvedOrderID || orderID != fact.order.ID {
 				state.add("fact_unavailable", step.ID, "arguments.order_id", "current order facts are unavailable")
 			} else if fact.order.UserID != state.context.UserID {
 				state.add("order_not_owned", step.ID, "arguments.order_id", "order does not belong to the verified user")
@@ -394,25 +423,36 @@ func (state *verificationState) validateFactsAndAmounts(ctx context.Context, ver
 		switch step.Tool {
 		case "issue_refund":
 			amount, hasAmount := int64Argument(arguments, "amount_cents")
-			orderID, hasOrder := stringArgument(arguments, "order_id")
-			fact := facts[orderID]
-			if hasAmount && hasOrder && fact.err == nil && fact.order.ID == orderID && fact.order.UserID == state.context.UserID {
+			if hasAmount && hasOrder && fact.err == nil && fact.order.ID == state.context.ResolvedOrderID && fact.order.UserID == state.context.UserID {
 				balance := fact.order.PaidAmountCents - fact.order.RefundedAmountCents
 				if amount <= 0 || amount > balance {
 					state.add("refund_amount_exceeds_balance", step.ID, "arguments.amount_cents", "refund must be positive and no greater than the current refundable balance")
 				}
 			}
-		case "issue_coupon":
-			amount, hasAmount := int64Argument(arguments, "amount_cents")
-			if !hasAmount {
-				continue
+		case "create_replacement":
+			sku, hasSKU := stringArgument(arguments, "sku")
+			if hasSKU && fact.err == nil && fact.order.ID == state.context.ResolvedOrderID && fact.order.UserID == state.context.UserID && sku != fact.order.SKU {
+				state.add("sku_mismatch", step.ID, "arguments.sku", "replacement sku must exactly match the trusted order sku")
 			}
-			capCents, hasCap := state.couponCap()
-			if !hasCap {
-				state.add("coupon_cap_missing", step.ID, "policy_refs", "applicable customer-care evidence must provide a typed coupon cap")
-			} else if amount <= 0 || amount > capCents {
-				state.add("coupon_amount_exceeds_cap", step.ID, "arguments.amount_cents", "coupon must be positive and no greater than the typed policy cap")
-			}
+		}
+	}
+	state.validateOrderlessAmounts()
+}
+
+func (state *verificationState) validateOrderlessAmounts() {
+	for index, step := range state.plan.Steps {
+		if step.Tool != "issue_coupon" || state.parsedArguments[index] == nil {
+			continue
+		}
+		amount, hasAmount := int64Argument(state.parsedArguments[index], "amount_cents")
+		if !hasAmount {
+			continue
+		}
+		capCents, hasCap := state.couponCap()
+		if !hasCap {
+			state.add("coupon_cap_missing", step.ID, "policy_refs", "applicable customer-care evidence must provide a typed coupon cap")
+		} else if amount <= 0 || amount > capCents {
+			state.add("coupon_amount_exceeds_cap", step.ID, "arguments.amount_cents", "coupon must be positive and no greater than the typed policy cap")
 		}
 	}
 }

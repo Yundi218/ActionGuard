@@ -18,6 +18,11 @@ type fakeAuthenticator struct {
 	calls     int
 }
 
+type readErrorBody struct{ err error }
+
+func (body readErrorBody) Read([]byte) (int, error) { return 0, body.err }
+func (readErrorBody) Close() error                  { return nil }
+
 func (f *fakeAuthenticator) Authenticate(*http.Request) (auth.Principal, error) {
 	f.calls++
 	return f.principal, f.err
@@ -124,6 +129,39 @@ func TestStrictJSONRejectsInvalidUTF8(t *testing.T) {
 	if rec.Code != 400 || service.calls != 0 {
 		t.Fatalf("status/body/calls=%d %q %d", rec.Code, rec.Body.String(), service.calls)
 	}
+}
+
+func TestCanceledRequestBodyReadReturnsStable408(t *testing.T) {
+	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			authenticator := &fakeAuthenticator{principal: auth.Principal{UserID: "user_018", Scopes: []string{"order:read"}}}
+			service := &fakeSessionService{}
+			req := httptest.NewRequest(http.MethodPost, "/v1/sessions", nil)
+			req.Body = readErrorBody{err: cause}
+			req.Header.Set("Authorization", "Bearer token")
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			NewRouter(Dependencies{Authenticator: authenticator, Sessions: service}).ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusRequestTimeout || recorder.Body.String() != `{"error":{"code":"request_canceled"}}`+"\n" || service.calls != 0 {
+				t.Fatalf("status/body/calls=%d %q %d", recorder.Code, recorder.Body.String(), service.calls)
+			}
+		})
+	}
+
+	t.Run("request context already canceled", func(t *testing.T) {
+		authenticator := &fakeAuthenticator{principal: auth.Principal{UserID: "user_018", Scopes: []string{"order:read"}}}
+		service := &fakeSessionService{}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		req := httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(`{"region":"CN"}`)).WithContext(ctx)
+		req.Header.Set("Authorization", "Bearer token")
+		req.Header.Set("Content-Type", "application/json")
+		recorder := httptest.NewRecorder()
+		NewRouter(Dependencies{Authenticator: authenticator, Sessions: service}).ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusRequestTimeout || recorder.Body.String() != `{"error":{"code":"request_canceled"}}`+"\n" || strings.Contains(recorder.Body.String(), context.Canceled.Error()) {
+			t.Fatalf("status/body=%d %q", recorder.Code, recorder.Body.String())
+		}
+	})
 }
 
 func TestHTTPErrorMappingAndCompletedFailedView(t *testing.T) {

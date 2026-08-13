@@ -14,7 +14,7 @@ import (
 const (
 	FixtureOrderLookupMessage       = "Look up order AG-1042."
 	FixtureReplacementMessage       = "Order AG-1042 arrived damaged. Replace it."
-	FixtureReplacementCouponMessage = "My headphones arrived damaged. Can I get a replacement and a coupon?"
+	FixtureReplacementCouponMessage = "Order AG-1042 arrived damaged. Can I get a replacement and a coupon?"
 )
 
 var ErrUnsupportedFixture = errors.New("fixture planner example unsupported")

@@ -1,6 +1,7 @@
 package verifier
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -182,6 +183,56 @@ func TestVerifierBindsReplacementInventorySKU(t *testing.T) {
 	requireErrorCode(t, result, "sku_mismatch")
 }
 
+func TestVerifierBindsEveryOrderStepToTrustedResolvedOrder(t *testing.T) {
+	t.Run("read mismatch", func(t *testing.T) {
+		plan, verificationContext, reader := singleToolFixture("get_order", json.RawMessage(`{"order_id":"AG-1043"}`))
+		verificationContext.ResolvedOrderID = "AG-1042"
+		reader.orders["AG-1043"] = commerce.Order{ID: "AG-1043", UserID: verificationContext.UserID, SKU: "SKU-RED-42"}
+
+		sealed, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+		requireErrorCode(t, result, "resolved_order_mismatch")
+		if sealed.UserID() != "" || len(reader.calls) != 0 {
+			t.Fatalf("mismatched read sealed or loaded untrusted facts: sealed=%#v calls=%#v", sealed, reader.calls)
+		}
+	})
+
+	t.Run("write mismatch", func(t *testing.T) {
+		plan, verificationContext, reader := validReplacementFixture()
+		for index := range plan.Steps {
+			plan.Steps[index].Arguments = bytes.ReplaceAll(plan.Steps[index].Arguments, []byte("AG-1042"), []byte("AG-1043"))
+		}
+		reader.orders["AG-1043"] = commerce.Order{ID: "AG-1043", UserID: verificationContext.UserID, SKU: "SKU-RED-42"}
+
+		sealed, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+		requireErrorCode(t, result, "resolved_order_mismatch")
+		if sealed.UserID() != "" || len(reader.calls) != 0 {
+			t.Fatalf("mismatched write sealed or loaded untrusted facts: sealed=%#v calls=%#v", sealed, reader.calls)
+		}
+	})
+}
+
+func TestVerifierRequiresSafeTrustedOrderForOrderBoundPlans(t *testing.T) {
+	for _, resolvedOrderID := range []string{"", "ag-1042", "AG-123", "AG-1042 extra"} {
+		t.Run(resolvedOrderID, func(t *testing.T) {
+			plan, verificationContext, reader := singleToolFixture("get_order", json.RawMessage(`{"order_id":"AG-1042"}`))
+			verificationContext.ResolvedOrderID = resolvedOrderID
+			_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+			requireErrorCode(t, result, "invalid_context")
+			if len(reader.calls) != 0 {
+				t.Fatalf("unsafe trusted order loaded facts: %#v", reader.calls)
+			}
+		})
+	}
+}
+
+func TestVerifierBindsReplacementSKUToTrustedOrderFact(t *testing.T) {
+	plan, verificationContext, reader := validReplacementFixture()
+	reader.orders[verificationContext.ResolvedOrderID] = commerce.Order{ID: verificationContext.ResolvedOrderID, UserID: verificationContext.UserID, SKU: "SKU-BLUE-99", PaidAmountCents: 12000}
+
+	_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
+	requireErrorCode(t, result, "sku_mismatch")
+}
+
 func TestVerifierRejectsSemanticallyDuplicateWriteArguments(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -205,7 +256,7 @@ func TestVerifierRejectsSemanticallyDuplicateWriteArguments(t *testing.T) {
 		duplicate.Arguments = json.RawMessage(`{"amount_cents":5e2,"order_id":"AG-1042"}`)
 		duplicate.DependsOn = []string{"order", "refund"}
 		plan.Steps = append(plan.Steps, duplicate)
-		verificationContext := Context{UserID: "user-018", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{refundEvidence()}}
+		verificationContext := Context{UserID: "user-018", ResolvedOrderID: "AG-1042", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{refundEvidence()}}
 		reader := &fakeFactReader{orders: map[string]commerce.Order{"AG-1042": {ID: "AG-1042", UserID: "user-018", PaidAmountCents: 12000}}}
 
 		_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
@@ -407,7 +458,7 @@ func TestVerifierRequiresExactApplicableTypedEvidence(t *testing.T) {
 func TestVerifierRejectsRefundAboveCurrentBalance(t *testing.T) {
 	plan := refundPlan(9001, true, "refund.created")
 	verificationContext := Context{
-		UserID: "user-018", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow,
+		UserID: "user-018", ResolvedOrderID: "AG-1042", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow,
 		Evidence: []policy.Evidence{refundEvidence()},
 	}
 	reader := &fakeFactReader{orders: map[string]commerce.Order{
@@ -425,7 +476,7 @@ func TestVerifierRejectsCouponAboveTypedEvidenceCap(t *testing.T) {
 		Goal: "issue service recovery coupon", PolicyRefs: []string{evidence.CitationID},
 		Steps: []agent.Step{{ID: "coupon", Tool: "issue_coupon", Arguments: json.RawMessage(`{"amount_cents":2001,"reason":"service recovery"}`), DependsOn: []string{}, Risk: toolkit.HighRiskWrite, SuccessCondition: "coupon.created", ApprovalRequired: true}},
 	}
-	verificationContext := Context{UserID: "user-018", Scopes: []string{"coupon:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{evidence}}
+	verificationContext := Context{UserID: "user-018", ResolvedOrderID: "AG-1042", Scopes: []string{"coupon:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{evidence}}
 	_, result := New(nil).VerifyAndSeal(context.Background(), plan, verificationContext)
 	requireErrorCode(t, result, "coupon_amount_exceeds_cap")
 }
@@ -440,7 +491,7 @@ func TestVerifierRequiresWritePostconditionAndHighRiskApproval(t *testing.T) {
 
 	t.Run("high risk approval", func(t *testing.T) {
 		plan := refundPlan(500, false, "refund.created")
-		verificationContext := Context{UserID: "user-018", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{refundEvidence()}}
+		verificationContext := Context{UserID: "user-018", ResolvedOrderID: "AG-1042", Scopes: []string{"order:read", "refund:write"}, Now: verifierTestNow, Evidence: []policy.Evidence{refundEvidence()}}
 		reader := &fakeFactReader{orders: map[string]commerce.Order{"AG-1042": {ID: "AG-1042", UserID: "user-018", PaidAmountCents: 12000}}}
 		_, result := New(reader).VerifyAndSeal(context.Background(), plan, verificationContext)
 		requireErrorCode(t, result, "approval_required")
@@ -461,7 +512,7 @@ func validReplacementFixture() (agent.ActionPlan, Context, *fakeFactReader) {
 		},
 	}
 	verificationContext := Context{
-		UserID: "user-018",
+		UserID: "user-018", ResolvedOrderID: "AG-1042",
 		Scopes: []string{"order:read", "eligibility:read", "inventory:read", "replacement:write"},
 		Now:    verifierTestNow,
 		Evidence: []policy.Evidence{
@@ -504,7 +555,7 @@ func singleToolFixture(tool string, arguments json.RawMessage) (agent.ActionPlan
 		ID: "step", Tool: tool, Arguments: arguments, DependsOn: []string{}, Risk: contract.Risk,
 		SuccessCondition: firstSuccessCondition(tool), ApprovalRequired: contract.Risk == toolkit.HighRiskWrite,
 	}}}
-	verificationContext := Context{UserID: "user-018", Scopes: []string{contract.Scope}, Now: verifierTestNow}
+	verificationContext := Context{UserID: "user-018", ResolvedOrderID: "AG-1042", Scopes: []string{contract.Scope}, Now: verifierTestNow}
 	reader := &fakeFactReader{orders: map[string]commerce.Order{"AG-1042": {ID: "AG-1042", UserID: "user-018", PaidAmountCents: 12000}}}
 	if policyID, needsEvidence := requiredPolicyByTool[tool]; needsEvidence {
 		requirement := policyRequirements[policyID]

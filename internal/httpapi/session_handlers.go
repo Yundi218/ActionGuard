@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -100,6 +101,10 @@ func (handlers sessionHandlers) authenticate(writer http.ResponseWriter, request
 }
 
 func decodeBody(writer http.ResponseWriter, request *http.Request, destination any, allowedFields ...string) bool {
+	if request.Context().Err() != nil {
+		writeError(writer, http.StatusRequestTimeout, "request_canceled")
+		return false
+	}
 	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
 	if err != nil || mediaType != "application/json" {
 		writeDecodeError(writer, errMediaType)
@@ -111,7 +116,15 @@ func decodeBody(writer http.ResponseWriter, request *http.Request, destination a
 	}
 	data, err := io.ReadAll(io.LimitReader(request.Body, maxRequestBodyBytes+1))
 	if err != nil {
+		if request.Context().Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			writeError(writer, http.StatusRequestTimeout, "request_canceled")
+			return false
+		}
 		writeDecodeError(writer, errInvalidJSON)
+		return false
+	}
+	if request.Context().Err() != nil {
+		writeError(writer, http.StatusRequestTimeout, "request_canceled")
 		return false
 	}
 	if len(data) > maxRequestBodyBytes {

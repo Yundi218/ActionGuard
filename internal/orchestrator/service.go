@@ -32,6 +32,8 @@ var (
 	ErrService  = errors.New("service unavailable")
 )
 
+const cancellationCleanupTimeout = 500 * time.Millisecond
+
 type Store interface {
 	planningstore.Store
 }
@@ -168,22 +170,43 @@ func (service *Service) RunMessage(ctx context.Context, principal auth.Principal
 	}
 	now := service.now().UTC()
 	if err := service.store.CreateRun(ctx, planningstore.Run{ID: runID, SessionID: session.ID, Status: "planning", Goal: message, CreatedAt: now, UpdatedAt: now}, message); err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return RunView{}, mapStoreError(ctx, err)
+	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
 	}
 
 	resolved, err := service.resolver.Resolve(ctx, principal.UserID, session.Region, message)
 	if err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		if errors.Is(err, querycontext.ErrNeedsInput) {
 			if transitionErr := service.store.TransitionRun(ctx, runID, "planning", "needs_input", planningstore.RunResult{Summary: "additional input required"}, "", ""); transitionErr != nil {
+				if isCancellation(ctx, transitionErr) {
+					return service.cancelCreatedRun(runID)
+				}
 				return RunView{}, mapStoreError(ctx, transitionErr)
 			}
-			return service.GetRun(ctx, principal, runID)
+			return service.getCreatedRun(ctx, principal, runID)
 		}
 		return service.failAndGet(ctx, principal, runID, "planning", "context_resolution_failed")
 	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
+	}
 	evidence, err := service.retriever.Search(ctx, policy.Query{Text: message, At: resolved.At, Region: resolved.Region, ProductCategory: resolved.ProductCategory, Limit: 5})
 	if err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return service.failAndGet(ctx, principal, runID, "planning", "retrieval_failed")
+	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
 	}
 	if !validEvidence(evidence) {
 		return service.failAndGet(ctx, principal, runID, "planning", "retrieval_failed")
@@ -192,53 +215,95 @@ func (service *Service) RunMessage(ctx context.Context, principal auth.Principal
 	request := llm.PlanRequest{UserMessage: message, Evidence: cloneEvidence(evidence), ToolContracts: toolkit.Registry()}
 	plan, err := service.planner.Plan(ctx, clonePlanRequest(request))
 	if err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return service.failAndGet(ctx, principal, runID, "planning", "planning_failed")
+	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
 	}
 	plan, err = canonicalPlan(plan)
 	if err != nil {
 		return service.failAndGet(ctx, principal, runID, "planning", "planning_failed")
 	}
-	sealed, verification := service.verifier.VerifyAndSeal(ctx, clonePlan(plan), verifier.Context{UserID: principal.UserID, Scopes: append([]string(nil), principal.Scopes...), Now: resolved.At, Evidence: cloneEvidence(evidence)})
+	sealed, verification := service.verifier.VerifyAndSeal(ctx, clonePlan(plan), verifier.Context{UserID: principal.UserID, ResolvedOrderID: resolved.OrderID, Scopes: append([]string(nil), principal.Scopes...), Now: resolved.At, Evidence: cloneEvidence(evidence)})
 	if ctx.Err() != nil {
-		return RunView{}, ErrCanceled
+		return service.cancelCreatedRun(runID)
 	}
 	if !verification.Valid {
 		if err := service.saveSnapshot(ctx, runID, "planning", "planning", 1, plan, evidence, verification); err != nil {
+			if isCancellation(ctx, err) {
+				return service.cancelCreatedRun(runID)
+			}
 			return RunView{}, err
+		}
+		if ctx.Err() != nil {
+			return service.cancelCreatedRun(runID)
 		}
 		repaired, repairErr := service.planner.Repair(ctx, llm.RepairRequest{Original: clonePlanRequest(request), Plan: clonePlan(plan), Errors: append([]verifier.Error(nil), verification.Errors...)})
 		if repairErr != nil {
+			if isCancellation(ctx, repairErr) {
+				return service.cancelCreatedRun(runID)
+			}
 			return service.failAndGet(ctx, principal, runID, "planning", "planning_failed")
+		}
+		if ctx.Err() != nil {
+			return service.cancelCreatedRun(runID)
 		}
 		plan, repairErr = canonicalPlan(repaired)
 		if repairErr != nil {
 			return service.failAndGet(ctx, principal, runID, "planning", "planning_failed")
 		}
-		sealed, verification = service.verifier.VerifyAndSeal(ctx, clonePlan(plan), verifier.Context{UserID: principal.UserID, Scopes: append([]string(nil), principal.Scopes...), Now: resolved.At, Evidence: cloneEvidence(evidence)})
+		sealed, verification = service.verifier.VerifyAndSeal(ctx, clonePlan(plan), verifier.Context{UserID: principal.UserID, ResolvedOrderID: resolved.OrderID, Scopes: append([]string(nil), principal.Scopes...), Now: resolved.At, Evidence: cloneEvidence(evidence)})
 		if ctx.Err() != nil {
-			return RunView{}, ErrCanceled
+			return service.cancelCreatedRun(runID)
 		}
 		if !verification.Valid {
 			if err := service.saveSnapshot(ctx, runID, "planning", "planning", 2, plan, evidence, verification); err != nil {
+				if isCancellation(ctx, err) {
+					return service.cancelCreatedRun(runID)
+				}
 				return RunView{}, err
+			}
+			if ctx.Err() != nil {
+				return service.cancelCreatedRun(runID)
 			}
 			return service.failAndGet(ctx, principal, runID, "planning", "verification_failed")
 		}
 		if err := service.saveSnapshot(ctx, runID, "planning", "ready", 2, plan, evidence, verification); err != nil {
+			if isCancellation(ctx, err) {
+				return service.cancelCreatedRun(runID)
+			}
 			return RunView{}, err
 		}
 	} else if err := service.saveSnapshot(ctx, runID, "planning", "ready", 1, plan, evidence, verification); err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return RunView{}, err
+	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
 	}
 
 	if err := service.store.TransitionRun(ctx, runID, "ready", "running", planningstore.RunResult{}, "", ""); err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return RunView{}, mapStoreError(ctx, err)
+	}
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
 	}
 	execution, executeErr := service.executor.Execute(ctx, tools.ExecutionRequest{RunID: runID, Plan: sealed})
 	if ctx.Err() != nil {
-		return RunView{}, ErrCanceled
+		return service.cancelCreatedRun(runID)
 	}
 	if executeErr != nil {
+		if isCancellation(ctx, executeErr) {
+			return service.cancelCreatedRun(runID)
+		}
 		return service.failAndGet(ctx, principal, runID, "running", "execution_failed")
 	}
 	target := execution.Status
@@ -253,9 +318,15 @@ func (service *Service) RunMessage(ctx context.Context, principal auth.Principal
 		detail = "execution_failed"
 	}
 	if err := service.store.TransitionRun(ctx, runID, "running", target, result, code, detail); err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return RunView{}, mapStoreError(ctx, err)
 	}
-	return service.GetRun(ctx, principal, runID)
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
+	}
+	return service.getCreatedRun(ctx, principal, runID)
 }
 
 func (service *Service) GetRun(ctx context.Context, principal auth.Principal, runID string) (RunView, error) {
@@ -291,12 +362,52 @@ func (service *Service) saveSnapshot(ctx context.Context, runID, from, to string
 
 func (service *Service) failAndGet(ctx context.Context, principal auth.Principal, runID, from, code string) (RunView, error) {
 	if ctx.Err() != nil {
-		return RunView{}, ErrCanceled
+		return service.cancelCreatedRun(runID)
 	}
 	if err := service.store.TransitionRun(ctx, runID, from, "failed", planningstore.RunResult{}, code, code); err != nil {
+		if isCancellation(ctx, err) {
+			return service.cancelCreatedRun(runID)
+		}
 		return RunView{}, mapStoreError(ctx, err)
 	}
-	return service.GetRun(ctx, principal, runID)
+	if ctx.Err() != nil {
+		return service.cancelCreatedRun(runID)
+	}
+	return service.getCreatedRun(ctx, principal, runID)
+}
+
+func (service *Service) getCreatedRun(ctx context.Context, principal auth.Principal, runID string) (RunView, error) {
+	view, err := service.GetRun(ctx, principal, runID)
+	if err != nil && isCancellation(ctx, err) {
+		return service.cancelCreatedRun(runID)
+	}
+	return view, err
+}
+
+func (service *Service) cancelCreatedRun(runID string) (RunView, error) {
+	service.convergeCanceledRun(runID)
+	return RunView{}, ErrCanceled
+}
+
+func (service *Service) convergeCanceledRun(runID string) {
+	cleanupContext, cancel := context.WithTimeout(context.Background(), cancellationCleanupTimeout)
+	defer cancel()
+	for _, from := range []string{"planning", "ready", "running"} {
+		err := service.store.TransitionRun(cleanupContext, runID, from, "failed", planningstore.RunResult{}, "request_canceled", "request_canceled")
+		if err == nil || errors.Is(err, planningstore.ErrNotFound) {
+			return
+		}
+		if cleanupContext.Err() != nil {
+			return
+		}
+		if !errors.Is(err, planningstore.ErrStateConflict) {
+			return
+		}
+	}
+}
+
+func isCancellation(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrCanceled)
 }
 
 func (service *Service) newID() (string, error) {
@@ -350,7 +461,7 @@ func deduplicate(values []string) []string {
 }
 
 func mapStoreError(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return ErrCanceled
 	}
 	switch {
