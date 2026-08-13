@@ -5,6 +5,8 @@ import (
 	"errors"
 )
 
+var ErrUntrustedCallContextJSON = errors.New("trusted call context cannot be decoded from JSON")
+
 type Risk string
 
 const (
@@ -19,6 +21,11 @@ type CallContext struct {
 	UserID         string
 	Scopes         []string
 	IdempotencyKey string
+}
+
+// UnmarshalJSON prevents trusted metadata from being populated by tool arguments.
+func (*CallContext) UnmarshalJSON([]byte) error {
+	return ErrUntrustedCallContextJSON
 }
 
 func (c CallContext) HasScope(want string) bool {

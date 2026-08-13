@@ -15,7 +15,14 @@ type fakeStore struct {
 	shipment  Shipment
 	inventory Inventory
 	result    WriteResult
-	err       error
+
+	getOrderErr    error
+	shipmentErr    error
+	inventoryErr   error
+	returnErr      error
+	replacementErr error
+	refundErr      error
+	couponErr      error
 
 	getOrderIDs    []string
 	shipmentOrders []string
@@ -24,6 +31,14 @@ type fakeStore struct {
 	replaceCalls   []replacementCall
 	refundCalls    []refundCall
 	couponCalls    []couponCall
+
+	getOrderContexts    []context.Context
+	shipmentContexts    []context.Context
+	inventoryContexts   []context.Context
+	returnContexts      []context.Context
+	replacementContexts []context.Context
+	refundContexts      []context.Context
+	couponContexts      []context.Context
 }
 
 type returnCall struct {
@@ -52,58 +67,65 @@ type couponCall struct {
 	idempotencyKey string
 }
 
-func (f *fakeStore) GetOrder(_ context.Context, id string) (Order, error) {
+func (f *fakeStore) GetOrder(ctx context.Context, id string) (Order, error) {
 	f.getOrderIDs = append(f.getOrderIDs, id)
-	if f.err != nil {
-		return Order{}, fmt.Errorf("get order: %w", f.err)
+	f.getOrderContexts = append(f.getOrderContexts, ctx)
+	if f.getOrderErr != nil {
+		return Order{}, fmt.Errorf("get order: %w", f.getOrderErr)
 	}
 	return f.order, nil
 }
 
-func (f *fakeStore) GetShipmentByOrder(_ context.Context, orderID string) (Shipment, error) {
+func (f *fakeStore) GetShipmentByOrder(ctx context.Context, orderID string) (Shipment, error) {
 	f.shipmentOrders = append(f.shipmentOrders, orderID)
-	if f.err != nil {
-		return Shipment{}, fmt.Errorf("get shipment: %w", f.err)
+	f.shipmentContexts = append(f.shipmentContexts, ctx)
+	if f.shipmentErr != nil {
+		return Shipment{}, fmt.Errorf("get shipment: %w", f.shipmentErr)
 	}
 	return f.shipment, nil
 }
 
-func (f *fakeStore) GetInventory(_ context.Context, sku string) (Inventory, error) {
+func (f *fakeStore) GetInventory(ctx context.Context, sku string) (Inventory, error) {
 	f.inventorySKUs = append(f.inventorySKUs, sku)
-	if f.err != nil {
-		return Inventory{}, fmt.Errorf("get inventory: %w", f.err)
+	f.inventoryContexts = append(f.inventoryContexts, ctx)
+	if f.inventoryErr != nil {
+		return Inventory{}, fmt.Errorf("get inventory: %w", f.inventoryErr)
 	}
 	return f.inventory, nil
 }
 
-func (f *fakeStore) CreateReturn(_ context.Context, orderID, reason, idempotencyKey string) (WriteResult, error) {
+func (f *fakeStore) CreateReturn(ctx context.Context, orderID, reason, idempotencyKey string) (WriteResult, error) {
 	f.returnCalls = append(f.returnCalls, returnCall{orderID, reason, idempotencyKey})
-	if f.err != nil {
-		return WriteResult{}, fmt.Errorf("create return: %w", f.err)
+	f.returnContexts = append(f.returnContexts, ctx)
+	if f.returnErr != nil {
+		return WriteResult{}, fmt.Errorf("create return: %w", f.returnErr)
 	}
 	return f.result, nil
 }
 
-func (f *fakeStore) CreateReplacement(_ context.Context, orderID, sku, reason, idempotencyKey string) (WriteResult, error) {
+func (f *fakeStore) CreateReplacement(ctx context.Context, orderID, sku, reason, idempotencyKey string) (WriteResult, error) {
 	f.replaceCalls = append(f.replaceCalls, replacementCall{orderID, sku, reason, idempotencyKey})
-	if f.err != nil {
-		return WriteResult{}, fmt.Errorf("create replacement: %w", f.err)
+	f.replacementContexts = append(f.replacementContexts, ctx)
+	if f.replacementErr != nil {
+		return WriteResult{}, fmt.Errorf("create replacement: %w", f.replacementErr)
 	}
 	return f.result, nil
 }
 
-func (f *fakeStore) IssueRefund(_ context.Context, orderID string, amountCents int64, idempotencyKey string) (WriteResult, error) {
+func (f *fakeStore) IssueRefund(ctx context.Context, orderID string, amountCents int64, idempotencyKey string) (WriteResult, error) {
 	f.refundCalls = append(f.refundCalls, refundCall{orderID, amountCents, idempotencyKey})
-	if f.err != nil {
-		return WriteResult{}, fmt.Errorf("issue refund: %w", f.err)
+	f.refundContexts = append(f.refundContexts, ctx)
+	if f.refundErr != nil {
+		return WriteResult{}, fmt.Errorf("issue refund: %w", f.refundErr)
 	}
 	return f.result, nil
 }
 
-func (f *fakeStore) IssueCoupon(_ context.Context, userID string, amountCents int64, reason, idempotencyKey string) (WriteResult, error) {
+func (f *fakeStore) IssueCoupon(ctx context.Context, userID string, amountCents int64, reason, idempotencyKey string) (WriteResult, error) {
 	f.couponCalls = append(f.couponCalls, couponCall{userID, amountCents, reason, idempotencyKey})
-	if f.err != nil {
-		return WriteResult{}, fmt.Errorf("issue coupon: %w", f.err)
+	f.couponContexts = append(f.couponContexts, ctx)
+	if f.couponErr != nil {
+		return WriteResult{}, fmt.Errorf("issue coupon: %w", f.couponErr)
 	}
 	return f.result, nil
 }
@@ -222,6 +244,14 @@ func TestServiceCreateReturnRejectsIneligibleOrder(t *testing.T) {
 	}
 }
 
+func TestServiceCreateReplacementRejectsIneligibleOrderWithoutCheckingInventoryOrWriting(t *testing.T) {
+	store := &fakeStore{order: Order{ID: "AG-1042", UserID: "user_018", Status: "shipped"}}
+	_, err := NewService(store).CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-BLUE-7", "wrong size", "replacement-key-1")
+	if !errors.Is(err, ErrIneligible) || len(store.inventorySKUs) != 0 || len(store.replaceCalls) != 0 {
+		t.Fatalf("err = %v, inventory calls = %#v, replacement calls = %#v", err, store.inventorySKUs, store.replaceCalls)
+	}
+}
+
 func TestServiceCreateReplacementRequiresPositiveInventoryAndForwardsArguments(t *testing.T) {
 	delivered := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -299,43 +329,101 @@ func TestServiceIssueCouponEnforcesPhaseOneLimitsAndForwardsArguments(t *testing
 	}
 }
 
-func TestServicePreservesStorageErrors(t *testing.T) {
+func TestServicePropagatesErrorsFromReachedStoreMethods(t *testing.T) {
 	delivered := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
 	for _, tt := range []struct {
-		name string
-		call func(*Service) error
+		name  string
+		store *fakeStore
+		call  func(*Service) error
 	}{
-		{name: "get order", call: func(s *Service) error { _, err := s.GetOrder(context.Background(), "user_018", "AG-1042"); return err }},
-		{name: "get shipment", call: func(s *Service) error {
+		{name: "get order", store: &fakeStore{getOrderErr: errStorage}, call: func(s *Service) error { _, err := s.GetOrder(context.Background(), "user_018", "AG-1042"); return err }},
+		{name: "get shipment", store: &fakeStore{shipmentErr: errStorage}, call: func(s *Service) error {
 			_, err := s.GetShipment(context.Background(), "user_018", "AG-1042")
 			return err
 		}},
-		{name: "check inventory", call: func(s *Service) error { _, err := s.CheckInventory(context.Background(), "SKU-RED-42"); return err }},
-		{name: "check eligibility", call: func(s *Service) error {
+		{name: "check inventory", store: &fakeStore{inventoryErr: errStorage}, call: func(s *Service) error { _, err := s.CheckInventory(context.Background(), "SKU-RED-42"); return err }},
+		{name: "check eligibility", store: &fakeStore{getOrderErr: errStorage}, call: func(s *Service) error {
 			_, err := s.CheckEligibility(context.Background(), "user_018", "AG-1042")
 			return err
 		}},
-		{name: "create return", call: func(s *Service) error {
+		{name: "create return", store: &fakeStore{returnErr: errStorage}, call: func(s *Service) error {
 			_, err := s.CreateReturn(context.Background(), "user_018", "AG-1042", "damaged", "return-key")
 			return err
 		}},
-		{name: "create replacement", call: func(s *Service) error {
+		{name: "create replacement inventory", store: &fakeStore{inventoryErr: errStorage}, call: func(s *Service) error {
 			_, err := s.CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
 			return err
 		}},
-		{name: "issue refund", call: func(s *Service) error {
+		{name: "create replacement write", store: &fakeStore{replacementErr: errStorage}, call: func(s *Service) error {
+			_, err := s.CreateReplacement(context.Background(), "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
+			return err
+		}},
+		{name: "issue refund", store: &fakeStore{refundErr: errStorage}, call: func(s *Service) error {
 			_, err := s.IssueRefund(context.Background(), "user_018", "AG-1042", 100, "refund-key")
 			return err
 		}},
-		{name: "issue coupon", call: func(s *Service) error {
+		{name: "issue coupon", store: &fakeStore{couponErr: errStorage}, call: func(s *Service) error {
 			_, err := s.IssueCoupon(context.Background(), "user_018", 100, "service recovery", "coupon-key")
 			return err
 		}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			store := &fakeStore{order: ownedDeliveredOrder(delivered), inventory: Inventory{Available: 1}, err: errStorage}
+			store := tt.store
+			store.order = ownedDeliveredOrder(delivered)
+			store.inventory = Inventory{Available: 1}
 			if err := tt.call(NewServiceWithClock(store, func() time.Time { return delivered })); !errors.Is(err, errStorage) {
 				t.Fatalf("err = %v, want wrapped storage error", err)
+			}
+		})
+	}
+}
+
+func TestServiceForwardsContextToEveryReachedStoreMethod(t *testing.T) {
+	type contextKey string
+	ctx := context.WithValue(context.Background(), contextKey("request"), "request-1")
+	delivered := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, tt := range []struct {
+		name     string
+		call     func(*Service) error
+		contexts func(*fakeStore) []context.Context
+	}{
+		{name: "get order", call: func(s *Service) error { _, err := s.GetOrder(ctx, "user_018", "AG-1042"); return err }, contexts: func(f *fakeStore) []context.Context { return f.getOrderContexts }},
+		{name: "get shipment", call: func(s *Service) error { _, err := s.GetShipment(ctx, "user_018", "AG-1042"); return err }, contexts: func(f *fakeStore) []context.Context { return append(f.getOrderContexts, f.shipmentContexts...) }},
+		{name: "get inventory", call: func(s *Service) error { _, err := s.CheckInventory(ctx, "SKU-RED-42"); return err }, contexts: func(f *fakeStore) []context.Context { return f.inventoryContexts }},
+		{name: "check eligibility", call: func(s *Service) error { _, err := s.CheckEligibility(ctx, "user_018", "AG-1042"); return err }, contexts: func(f *fakeStore) []context.Context { return f.getOrderContexts }},
+		{name: "create return", call: func(s *Service) error {
+			_, err := s.CreateReturn(ctx, "user_018", "AG-1042", "damaged", "return-key")
+			return err
+		}, contexts: func(f *fakeStore) []context.Context { return append(f.getOrderContexts, f.returnContexts...) }},
+		{name: "create replacement", call: func(s *Service) error {
+			_, err := s.CreateReplacement(ctx, "user_018", "AG-1042", "SKU-RED-42", "damaged", "replacement-key")
+			return err
+		}, contexts: func(f *fakeStore) []context.Context {
+			return append(append(f.getOrderContexts, f.inventoryContexts...), f.replacementContexts...)
+		}},
+		{name: "issue refund", call: func(s *Service) error {
+			_, err := s.IssueRefund(ctx, "user_018", "AG-1042", 100, "refund-key")
+			return err
+		}, contexts: func(f *fakeStore) []context.Context { return append(f.getOrderContexts, f.refundContexts...) }},
+		{name: "issue coupon", call: func(s *Service) error {
+			_, err := s.IssueCoupon(ctx, "user_018", 100, "service recovery", "coupon-key")
+			return err
+		}, contexts: func(f *fakeStore) []context.Context { return f.couponContexts }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			store := &fakeStore{order: ownedDeliveredOrder(delivered), inventory: Inventory{Available: 1}}
+			if err := tt.call(NewServiceWithClock(store, func() time.Time { return delivered })); err != nil {
+				t.Fatal(err)
+			}
+			gotContexts := tt.contexts(store)
+			if len(gotContexts) == 0 {
+				t.Fatal("store method was not called")
+			}
+			for _, got := range gotContexts {
+				if got != ctx {
+					t.Fatalf("context = %#v, want %#v", got, ctx)
+				}
 			}
 		})
 	}

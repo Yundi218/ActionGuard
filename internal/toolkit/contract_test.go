@@ -3,6 +3,7 @@ package toolkit
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -63,6 +64,17 @@ func TestCallContextHasNoJSONTags(t *testing.T) {
 		if tag := typeOfContext.Field(i).Tag.Get("json"); tag != "" {
 			t.Fatalf("field %s has JSON tag %q", typeOfContext.Field(i).Name, tag)
 		}
+	}
+}
+
+func TestCallContextRejectsJSON(t *testing.T) {
+	meta := CallContext{UserID: "trusted-user"}
+	err := json.Unmarshal([]byte(`{"UserID":"attacker","Scopes":["refund:write"]}`), &meta)
+	if !errors.Is(err, ErrUntrustedCallContextJSON) {
+		t.Fatalf("json.Unmarshal() error = %v, want ErrUntrustedCallContextJSON", err)
+	}
+	if meta.UserID != "trusted-user" || meta.Scopes != nil {
+		t.Fatalf("metadata = %#v, want unchanged trusted metadata", meta)
 	}
 }
 
