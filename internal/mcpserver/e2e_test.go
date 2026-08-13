@@ -15,6 +15,7 @@ import (
 	"github.com/Yundi218/ActionGuard/internal/commerce"
 	"github.com/Yundi218/ActionGuard/internal/database"
 	"github.com/Yundi218/ActionGuard/internal/toolkit"
+	"github.com/jackc/pgx/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -136,6 +137,15 @@ func TestDamagedItemReplacementAndCouponFlow(t *testing.T) {
 		t.Fatalf("replacement = %#v", replacement)
 	}
 
+	const couponKey = "e2e-coupon-user-018"
+	coupon := callTool[e2eEnvelope[commerce.WriteResult]](t, session, "issue_coupon", IssueCouponParams{
+		AmountCents: 1500,
+		Reason:      "damaged item service recovery",
+	}, e2eCallContext("coupon", "user_018", []string{"coupon:write"}, couponKey))
+	if coupon.Replayed || coupon.Trusted.ResourceType != "coupon" || coupon.Trusted.ResourceID == "" {
+		t.Fatalf("coupon = %#v", coupon)
+	}
+
 	replayed := callTool[e2eEnvelope[commerce.WriteResult]](t, session, "create_replacement", CreateReplacementParams{
 		OrderID: "AG-1042",
 		SKU:     "HP-71",
@@ -143,14 +153,6 @@ func TestDamagedItemReplacementAndCouponFlow(t *testing.T) {
 	}, e2eCallContext("replacement-replay", "user_018", []string{"replacement:write"}, replacementKey))
 	if !replayed.Replayed || !replayed.Trusted.Replayed || replayed.Trusted.ResourceID != replacement.Trusted.ResourceID {
 		t.Fatalf("replayed replacement = %#v, first = %#v", replayed, replacement)
-	}
-
-	coupon := callTool[e2eEnvelope[commerce.WriteResult]](t, session, "issue_coupon", IssueCouponParams{
-		AmountCents: 1500,
-		Reason:      "damaged item service recovery",
-	}, e2eCallContext("coupon", "user_018", []string{"coupon:write"}, "e2e-coupon-user-018"))
-	if coupon.Replayed || coupon.Trusted.ResourceType != "coupon" || coupon.Trusted.ResourceID == "" {
-		t.Fatalf("coupon = %#v", coupon)
 	}
 
 	shipment := callTool[e2eEnvelope[trustedShipment]](t, session, "get_shipment", GetShipmentParams{OrderID: "AG-1043"}, e2eCallContext("shipment", "user_018", []string{"shipment:read"}, ""))
@@ -176,6 +178,34 @@ func TestDamagedItemReplacementAndCouponFlow(t *testing.T) {
 	crossUserResult, err := callToolResult(session, "get_order", GetOrderParams{OrderID: "AG-9001"}, e2eCallContext("cross-user", "user_018", []string{"order:read"}, ""))
 	requireToolError(t, crossUserResult, err, commerce.ErrForbidden.Error())
 
+	var replacementOrderID, replacementSKU, replacementReason, replacementStatus string
+	if err := pool.QueryRow(ctx, `
+		select order_id, sku, reason, status
+		from replacements
+		where id = $1
+	`, replacement.Trusted.ResourceID).Scan(&replacementOrderID, &replacementSKU, &replacementReason, &replacementStatus); err != nil {
+		t.Fatal(err)
+	}
+	if replacementOrderID != "AG-1042" || replacementSKU != "HP-71" || replacementReason != "damaged item" || replacementStatus != "created" {
+		t.Fatalf("persisted replacement: order_id=%q sku=%q reason=%q status=%q", replacementOrderID, replacementSKU, replacementReason, replacementStatus)
+	}
+
+	var couponUserID, couponReason string
+	var couponAmountCents int64
+	if err := pool.QueryRow(ctx, `
+		select user_id, amount_cents, reason
+		from coupons
+		where id = $1
+	`, coupon.Trusted.ResourceID).Scan(&couponUserID, &couponAmountCents, &couponReason); err != nil {
+		t.Fatal(err)
+	}
+	if couponUserID != "user_018" || couponAmountCents != 1500 || couponReason != "damaged item service recovery" {
+		t.Fatalf("persisted coupon: user_id=%q amount_cents=%d reason=%q", couponUserID, couponAmountCents, couponReason)
+	}
+
+	assertIdempotencyMapping(t, ctx, pool, "create_replacement", replacementKey, replacement.Trusted.ResourceType, replacement.Trusted.ResourceID)
+	assertIdempotencyMapping(t, ctx, pool, "issue_coupon", couponKey, coupon.Trusted.ResourceType, coupon.Trusted.ResourceID)
+
 	var replacementCount, couponCount, idempotencyCount, unauthorizedIdempotencyCount int
 	if err := pool.QueryRow(ctx, `select count(*) from replacements`).Scan(&replacementCount); err != nil {
 		t.Fatal(err)
@@ -199,6 +229,25 @@ func TestDamagedItemReplacementAndCouponFlow(t *testing.T) {
 	}
 	if replacementCount != 1 || couponCount != 1 || idempotencyCount != 2 || unauthorizedIdempotencyCount != 0 || available != 11 || reserved != 1 {
 		t.Fatalf("database state: replacements=%d coupons=%d idempotency=%d unauthorized_idempotency=%d available=%d reserved=%d", replacementCount, couponCount, idempotencyCount, unauthorizedIdempotencyCount, available, reserved)
+	}
+}
+
+type idempotencyQuerier interface {
+	QueryRow(context.Context, string, ...any) pgx.Row
+}
+
+func assertIdempotencyMapping(t *testing.T, ctx context.Context, pool idempotencyQuerier, operation, key, wantType, wantID string) {
+	t.Helper()
+	var resultType, resultID string
+	if err := pool.QueryRow(ctx, `
+		select result_type, result_id
+		from idempotency_records
+		where operation = $1 and idempotency_key = $2
+	`, operation, key).Scan(&resultType, &resultID); err != nil {
+		t.Fatal(err)
+	}
+	if resultType != wantType || resultID != wantID {
+		t.Fatalf("idempotency mapping for %s/%s = %s/%s, want %s/%s", operation, key, resultType, resultID, wantType, wantID)
 	}
 }
 

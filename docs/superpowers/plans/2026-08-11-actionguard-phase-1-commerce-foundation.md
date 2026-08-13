@@ -1454,9 +1454,13 @@ useful project context already present:
 
 - [ ] **Step 7: Verify repository cleanliness and public reproducibility**
 
-Run: `rg -n "(sk-|ghp_|postgres://[^p]|bytedance|tencent|internal\.company)" . --glob '!docs/superpowers/**'`
+Run tracked-file scans with `git grep`, including checks for credentials, private
+keys, absolute home-directory paths, local identities, and internal hostnames.
+Confirm the tracked set separately with `git ls-files`, including dot-directories.
 
-Expected: no secret or company-internal match. The synthetic local PostgreSQL URL with password `postgres` may appear only in `.env.example`, Compose, CI, and README.
+Expected: no secret, local-identity, or company-internal match. Public synthetic
+local-development values may appear only where configuration, documentation, or
+their tests require them.
 
 Run: `git status --short`
 

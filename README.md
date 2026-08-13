@@ -60,13 +60,15 @@ make fixtures
 make mcp
 ```
 
-The MCP endpoint listens on `http://localhost:8081/mcp`. To build and run PostgreSQL and the MCP server as containers instead, use:
+`make fixtures` applies the public commerce migration and resets the synthetic fixture dataset together in one PostgreSQL transaction, so it works against a fresh database and remains safe to repeat. The MCP endpoint listens on `http://localhost:8081/mcp`.
+
+To build and run the seeded demo entirely with Compose, use:
 
 ```bash
 make demo-up
 ```
 
-The Compose environment contains only synthetic local-development values. It does not contain real service or user credentials. Load or reset the deterministic dataset with `make fixtures` while PostgreSQL is running.
+Compose waits for PostgreSQL health, runs a one-shot transactional fixture loader, and starts the MCP service only after loading succeeds. The environment contains only synthetic local-development values; it does not contain real service or user credentials.
 
 ## Verification
 
@@ -98,7 +100,7 @@ The E2E test migrates PostgreSQL, reloads fixtures, starts a real `httptest` MCP
 - All users, products, orders, shipments, inventory, replacements, coupons, and gateway values in this repository are synthetic.
 - Product descriptions and shipment notes are attacker-controlled free text. Tool responses keep such values under `untrusted_text`; they must never become trusted instructions or authorization inputs.
 - User identity, Scope, run ID, step ID, and idempotency keys come from gateway headers, not Tool JSON supplied by an Agent.
-- PostgreSQL ownership checks and transaction postconditions remain authoritative when prose and database state disagree.
+- The commerce service enforces ownership and authorization before writes. PostgreSQL constraints, transactions, and operation-scoped idempotency records protect persisted state and repeated requests.
 - The included gateway token and PostgreSQL password are local demo values only.
 
 ## Progress

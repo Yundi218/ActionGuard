@@ -13,6 +13,25 @@ services:
       timeout: 2s
       retries: 20
 
+  fixture-loader:
+    image: pgvector/pgvector:pg16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../migrations/001_commerce.sql:/migrations/001_commerce.sql:ro
+      - ../fixtures/commerce.sql:/fixtures/commerce.sql:ro
+    command:
+      - psql
+      - postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
+      - --single-transaction
+      - -v
+      - ON_ERROR_STOP=1
+      - -f
+      - /migrations/001_commerce.sql
+      - -f
+      - /fixtures/commerce.sql
+
   commerce-mcp:
     build:
       context: ..
@@ -20,6 +39,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      fixture-loader:
+        condition: service_completed_successfully
     environment:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/actionguard?sslmode=disable
       MCP_ADDR: :8081
