@@ -447,6 +447,69 @@ func TestExecutorPreservesOversizedToolResponseClassification(t *testing.T) {
 	}
 }
 
+func TestNewMCPExecutorPreservesOversizedInitializeClassificationWithoutTrustedHeaders(t *testing.T) {
+	tests := []struct {
+		name string
+		mode oversizedResponseMode
+	}{
+		{name: "declared", mode: oversizedDeclared},
+		{name: "streamed", mode: oversizedStreamed},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server := mcp.NewServer(&mcp.Implementation{Name: "oversized-initialize", Version: "v1"}, nil)
+			handler := mcp.NewStreamableHTTPHandler(
+				func(*http.Request) *mcp.Server { return server },
+				&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+			)
+			testServer := httptest.NewServer(handler)
+			t.Cleanup(testServer.Close)
+			transport := &oversizedInitializeTransport{next: http.DefaultTransport, mode: test.mode}
+			callerContext := toolkit.WithCallContext(context.Background(), toolkit.CallContext{
+				RunID: "caller-run", StepID: "caller-step", UserID: "caller-user",
+				Scopes: []string{"admin"}, IdempotencyKey: "caller-key",
+			})
+
+			executor, err := NewMCPExecutor(callerContext, MCPConfig{
+				Endpoint: testServer.URL, GatewayToken: testGatewayToken,
+				HTTPClient: &http.Client{Transport: transport},
+			})
+			if executor != nil || !errors.Is(err, ErrMCPResponseTooLarge) {
+				t.Fatalf("NewMCPExecutor() = %#v, %v; want nil/ErrMCPResponseTooLarge", executor, err)
+			}
+			headers := transport.initializeHeaders()
+			if got := headers.Get("Authorization"); got != "Bearer "+testGatewayToken {
+				t.Fatalf("initialize Authorization = %q", got)
+			}
+			for _, header := range trustedRequestHeaders[2:] {
+				if got := headers.Get(header); got != "" {
+					t.Fatalf("initialize leaked trusted header %s=%q", header, got)
+				}
+			}
+		})
+	}
+}
+
+func TestNewMCPExecutorCancellationPrecedesOversizedInitialize(t *testing.T) {
+	server := mcp.NewServer(&mcp.Implementation{Name: "cancel-initialize", Version: "v1"}, nil)
+	handler := mcp.NewStreamableHTTPHandler(
+		func(*http.Request) *mcp.Server { return server },
+		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true},
+	)
+	testServer := httptest.NewServer(handler)
+	t.Cleanup(testServer.Close)
+	ctx, cancel := context.WithCancel(context.Background())
+	transport := &oversizedInitializeTransport{next: http.DefaultTransport, mode: oversizedStreamed, cancel: cancel}
+
+	executor, err := NewMCPExecutor(ctx, MCPConfig{
+		Endpoint: testServer.URL, GatewayToken: testGatewayToken,
+		HTTPClient: &http.Client{Transport: transport},
+	})
+	if executor != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewMCPExecutor() = %#v, %v; want nil/context.Canceled", executor, err)
+	}
+}
+
 func TestExecutorCancellationTakesPriorityOverOversizedResponse(t *testing.T) {
 	recorder := &callRecorder{}
 	transport := &oversizedToolResponseTransport{next: http.DefaultTransport, mode: oversizedStreamed, cancel: true}
@@ -688,6 +751,53 @@ type oversizedToolResponseTransport struct {
 	mode       oversizedResponseMode
 	cancel     bool
 	cancelCall context.CancelFunc
+}
+
+type oversizedInitializeTransport struct {
+	next    http.RoundTripper
+	mode    oversizedResponseMode
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	headers http.Header
+}
+
+func (transport *oversizedInitializeTransport) RoundTrip(request *http.Request) (*http.Response, error) {
+	if request.Method != http.MethodPost || request.Body == nil {
+		return transport.next.RoundTrip(request)
+	}
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		return nil, err
+	}
+	request.Body = io.NopCloser(bytes.NewReader(body))
+	initialize := request.Method == http.MethodPost && bytes.Contains(body, []byte(`"method":"initialize"`))
+	response, err := transport.next.RoundTrip(request)
+	if err != nil || !initialize {
+		return response, err
+	}
+	transport.mu.Lock()
+	transport.headers = request.Header.Clone()
+	transport.mu.Unlock()
+	if transport.cancel != nil {
+		transport.cancel()
+	}
+	switch transport.mode {
+	case oversizedDeclared:
+		response.ContentLength = maxMCPResponseBytes + 1
+		response.Header.Set("Content-Length", "1048577")
+	case oversizedStreamed:
+		_ = response.Body.Close()
+		response.Body = io.NopCloser(bytes.NewReader(bytes.Repeat([]byte("x"), int(maxMCPResponseBytes+1))))
+		response.ContentLength = -1
+		response.Header.Del("Content-Length")
+	}
+	return response, nil
+}
+
+func (transport *oversizedInitializeTransport) initializeHeaders() http.Header {
+	transport.mu.Lock()
+	defer transport.mu.Unlock()
+	return transport.headers.Clone()
 }
 
 func (transport *oversizedToolResponseTransport) RoundTrip(request *http.Request) (*http.Response, error) {

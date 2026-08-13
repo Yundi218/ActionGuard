@@ -60,11 +60,12 @@ func NewMCPExecutor(ctx context.Context, config MCPConfig) (*MCPExecutor, error)
 	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return ErrMCPRedirect }
 
 	client := mcp.NewClient(&mcp.Implementation{Name: "actionguard-executor", Version: "v0.2.0"}, nil)
-	session, err := client.Connect(valueFreeContext{Context: ctx}, &mcp.StreamableClientTransport{
+	connectContext, responseState := withResponseLimitState(valueFreeContext{Context: ctx})
+	session, err := client.Connect(connectContext, &mcp.StreamableClientTransport{
 		Endpoint: endpoint, HTTPClient: &clientCopy, MaxRetries: -1, DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
-		return nil, sanitizeTransportError(ctx.Err(), err)
+		return nil, classifyTransportError(ctx, responseState, err)
 	}
 	return &MCPExecutor{session: session}, nil
 }
@@ -156,17 +157,13 @@ func (executor *MCPExecutor) Execute(ctx context.Context, request ExecutionReque
 		toolResult, callErr := executor.session.CallTool(callContext, &mcp.CallToolParams{
 			Name: step.Tool, Arguments: append(json.RawMessage(nil), step.Arguments...),
 		})
-		if contextErr := ctx.Err(); contextErr != nil {
-			result.Status = StatusFailed
-			return cloneExecutionResult(result), contextErr
-		}
-		if responseState.tooLarge.Load() {
-			result.Status = StatusFailed
-			return cloneExecutionResult(result), ErrMCPResponseTooLarge
-		}
 		if callErr != nil {
 			result.Status = StatusFailed
-			return cloneExecutionResult(result), sanitizeTransportError(ctx.Err(), callErr)
+			return cloneExecutionResult(result), classifyTransportError(ctx, responseState, callErr)
+		}
+		if classified := classifyResponseState(ctx, responseState); classified != nil {
+			result.Status = StatusFailed
+			return cloneExecutionResult(result), classified
 		}
 		stepResult, decodeErr := decodeToolResult(step, toolResult)
 		if decodeErr != nil {
@@ -176,6 +173,23 @@ func (executor *MCPExecutor) Execute(ctx context.Context, request ExecutionReque
 		result.Steps = append(result.Steps, stepResult)
 	}
 	return cloneExecutionResult(result), nil
+}
+
+func classifyTransportError(ctx context.Context, state *responseLimitState, err error) error {
+	if classified := classifyResponseState(ctx, state); classified != nil {
+		return classified
+	}
+	return sanitizeTransportError(nil, err)
+}
+
+func classifyResponseState(ctx context.Context, state *responseLimitState) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state != nil && state.tooLarge.Load() {
+		return ErrMCPResponseTooLarge
+	}
+	return nil
 }
 
 func preflight(request ExecutionRequest) (preflightPlan, error) {
