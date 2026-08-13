@@ -12,7 +12,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Yundi218/ActionGuard/internal/config"
 	"github.com/Yundi218/ActionGuard/internal/database"
+	"github.com/Yundi218/ActionGuard/internal/llm"
 	"github.com/Yundi218/ActionGuard/internal/policy"
 	policyassets "github.com/Yundi218/ActionGuard/policies"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -35,7 +37,7 @@ func TestRunMigratesEmptyDatabaseThenImportsAllEmbeddedPolicies(t *testing.T) {
 	}
 
 	var output bytes.Buffer
-	if err := run(ctx, databaseURL, &output); err != nil {
+	if err := run(ctx, databaseURL, deterministicProviderSettings(), &output); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := output.String(), "imported 3 policies\n"; got != want {
@@ -80,20 +82,24 @@ func TestRunMigratesEmptyDatabaseThenImportsAllEmbeddedPolicies(t *testing.T) {
 
 func TestRunIsDeterministicAndIdempotent(t *testing.T) {
 	ctx, databaseURL, pool := newPolicyImportTestDatabase(t)
-	if err := run(ctx, databaseURL, &bytes.Buffer{}); err != nil {
+	if err := run(ctx, databaseURL, deterministicProviderSettings(), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	first := importedPolicyState(t, ctx, pool)
 	time.Sleep(10 * time.Millisecond)
-	if err := run(ctx, databaseURL, &bytes.Buffer{}); err != nil {
+	if err := run(ctx, databaseURL, deterministicProviderSettings(), &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	second := importedPolicyState(t, ctx, pool)
 	if !slices.Equal(first, second) {
 		t.Fatalf("repeat import changed policy state:\nfirst:  %v\nsecond: %v", first, second)
 	}
-	if _, ok := newPolicyEmbedder().(policy.DeterministicEmbedder); !ok {
-		t.Fatalf("default embedder type = %T, want policy.DeterministicEmbedder", newPolicyEmbedder())
+	embedder, err := newPolicyEmbedder(deterministicProviderSettings())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := embedder.(policy.DeterministicEmbedder); !ok {
+		t.Fatalf("default embedder type = %T, want policy.DeterministicEmbedder", embedder)
 	}
 }
 
@@ -114,7 +120,7 @@ func TestImportAssetsUsesLexicalFilenameOrder(t *testing.T) {
 
 func TestRunRequiresDatabaseConfiguration(t *testing.T) {
 	var output bytes.Buffer
-	err := run(context.Background(), " \t", &output)
+	err := run(context.Background(), " \t", deterministicProviderSettings(), &output)
 	if !errors.Is(err, ErrDatabaseURLRequired) {
 		t.Fatalf("error = %v, want ErrDatabaseURLRequired", err)
 	}
@@ -126,7 +132,7 @@ func TestRunRequiresDatabaseConfiguration(t *testing.T) {
 func TestRunAndImportErrorsAreSanitized(t *testing.T) {
 	const secret = "secret-user:secret-password@private-db"
 	var output bytes.Buffer
-	err := run(context.Background(), "postgres://"+secret+"/%gh", &output)
+	err := run(context.Background(), "postgres://"+secret+"/%gh", deterministicProviderSettings(), &output)
 	if !errors.Is(err, ErrPolicyImport) {
 		t.Fatalf("database error = %v, want ErrPolicyImport", err)
 	}
@@ -138,6 +144,48 @@ func TestRunAndImportErrorsAreSanitized(t *testing.T) {
 	_, err = importAssets(context.Background(), failingImporter{err: errors.New(secret)}, []policyassets.Asset{{Name: "secret.md", Markdown: sensitivePolicy}})
 	if !errors.Is(err, ErrPolicyImport) || strings.Contains(err.Error(), secret) || strings.Contains(err.Error(), string(sensitivePolicy)) {
 		t.Fatalf("import error was not sanitized: %v", err)
+	}
+}
+
+func TestNewPolicyEmbedderUsesOpenAIOnlyInExplicitCompleteMode(t *testing.T) {
+	settings := config.ProviderSettings{
+		EmbeddingProvider:    config.ProviderOpenAI,
+		OpenAIBaseURL:        "https://openai.example.test",
+		OpenAIAPIKey:         "secret-key",
+		OpenAIEmbeddingModel: "embedding-model",
+	}
+	embedder, err := newPolicyEmbedder(settings)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := embedder.(*llm.OpenAIEmbedder); !ok {
+		t.Fatalf("embedder type = %T, want *llm.OpenAIEmbedder", embedder)
+	}
+}
+
+func TestNewPolicyEmbedderRejectsUnknownAndIncompleteOpenAIModes(t *testing.T) {
+	tests := []config.ProviderSettings{
+		{EmbeddingProvider: "unknown"},
+		{EmbeddingProvider: config.ProviderOpenAI, OpenAIAPIKey: "secret-key", OpenAIEmbeddingModel: "embedding-model", OpenAIBaseURL: "://secret-endpoint"},
+		{EmbeddingProvider: config.ProviderOpenAI, OpenAIEmbeddingModel: "embedding-model"},
+		{EmbeddingProvider: config.ProviderOpenAI, OpenAIAPIKey: "secret-key"},
+	}
+	for _, settings := range tests {
+		_, err := newPolicyEmbedder(settings)
+		if !errors.Is(err, ErrEmbeddingConfiguration) {
+			t.Fatalf("settings %#v error = %v, want ErrEmbeddingConfiguration", settings, err)
+		}
+		if strings.Contains(err.Error(), "secret-key") || strings.Contains(err.Error(), "secret-endpoint") {
+			t.Fatalf("configuration error leaked sensitive value: %v", err)
+		}
+	}
+}
+
+func deterministicProviderSettings() config.ProviderSettings {
+	return config.ProviderSettings{
+		LLMProvider:       config.ProviderDeterministic,
+		EmbeddingProvider: config.ProviderDeterministic,
+		OpenAIBaseURL:     config.DefaultOpenAIBaseURL,
 	}
 }
 
