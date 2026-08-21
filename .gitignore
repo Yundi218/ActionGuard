@@ -1,5 +1,9 @@
 .DS_Store
 .env
+web/node_modules/
+web/dist/
+web/coverage/
+web/*.tsbuildinfo
 .env.*
 !.env.example
 .superpowers/

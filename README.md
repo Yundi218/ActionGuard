@@ -75,6 +75,18 @@ Compose waits for PostgreSQL health, runs a one-shot transactional fixture loade
 
 The default is deterministic: `LLM_PROVIDER=deterministic` and `EMBEDDING_PROVIDER=deterministic`. This is a reproducible fixture planner and embedder, not a claim about model quality. To opt into OpenAI-compatible providers, explicitly set `LLM_PROVIDER=openai`, `EMBEDDING_PROVIDER=openai`, `OPENAI_API_KEY`, `OPENAI_MODEL`, and `OPENAI_EMBEDDING_MODEL`; `OPENAI_BASE_URL` is optional. Missing required OpenAI values fail startup instead of falling back.
 
+## Interview Workbench
+
+The React workbench includes a deterministic replacement scenario so the policy evidence, typed plan, verifier result, tool trust boundary, and final business state can be inspected without a paid model or external commerce service.
+
+```bash
+cd web
+pnpm install
+pnpm dev
+```
+
+The first task is intentionally demo-backed. Live Session API integration, approval controls, and benchmark views are tracked in the workbench implementation plan.
+
 ## Verification
 
 Unit tests can run without PostgreSQL-backed integration tests:
